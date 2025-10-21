@@ -666,26 +666,12 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
         if not self._enable_a2a_moe:
-            DUAL_STREAM_TOKEN_THRESHOLD = 1024
-            if (
-                self.alt_stream is not None
-                and self.num_fused_shared_experts == 0
-                and hidden_states.shape[0] > 0
-                and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
-            ):
-                return self.forward_normal_dual_stream(
-                    hidden_states,
-                    should_allreduce_fusion,
-                    use_reduce_scatter,
-                    gemm_output_zero_allocator,
-                )
-            else:
-                return self.forward_normal(
-                    hidden_states,
-                    should_allreduce_fusion,
-                    use_reduce_scatter,
-                    gemm_output_zero_allocator,
-                )
+            return self.forward_normal(
+                hidden_states,
+                should_allreduce_fusion,
+                use_reduce_scatter,
+                gemm_output_zero_allocator,
+            )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
 
@@ -1297,6 +1283,52 @@ class DeepseekV2AttentionMLA(nn.Module):
             state.pop("attn_intermediate_state")
         )
 
+    def _check_duplicates_divergence_attn(self, hidden_states: torch.Tensor, stage: str, forward_batch=None):
+        """
+        Debug: Simple check for attention - compare when batch_size == 50.
+        """
+        if not get_bool_env_var("SGLANG_DEBUG_CHECK_DUPLICATES"):
+            return
+        
+        batch_size = hidden_states.shape[0]
+        
+        # Only log when batch_size == 50
+        if batch_size != 50:
+            return
+        
+        # Compare all sequences with the first one
+        max_diff_overall = 0.0
+        mean_diff_overall = 0.0
+        max_pair = (0, 0)
+        
+        ref_seq = hidden_states[0]
+        
+        for i in range(1, batch_size):
+            curr_seq = hidden_states[i]
+            diff = torch.abs(ref_seq - curr_seq)
+            max_diff = torch.max(diff).item()
+            mean_diff = torch.mean(diff).item()
+            
+            if max_diff > max_diff_overall:
+                max_diff_overall = max_diff
+                mean_diff_overall = mean_diff
+                max_pair = (0, i)
+        
+        # Log to file
+        import json
+        divergence_log = {
+            "layer_id": self.layer_id,
+            "stage": f"attn_{stage}",
+            "batch_size": batch_size,
+            "max_diff": float(max_diff_overall),
+            "mean_diff": float(mean_diff_overall),
+            "max_diff_pair": max_pair,
+            "is_divergent": max_diff_overall > 0.0  # Log any difference
+        }
+        
+        with open("divergence_log.jsonl", "a") as f:
+            f.write(json.dumps(divergence_log) + "\n")
+    
     def forward(
         self,
         positions: torch.Tensor,
@@ -1304,13 +1336,20 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
+        self._check_duplicates_divergence_attn(hidden_states, "attn_input", forward_batch)
+        
         s = self.forward_prepare(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
         )
-        return self.forward_core(s)
+        
+        result = self.forward_core(s)
+        
+        self._check_duplicates_divergence_attn(result, "attn_output", forward_batch)
+        
+        return result
 
     def forward_prepare(
         self,
@@ -1513,7 +1552,11 @@ class DeepseekV2AttentionMLA(nn.Module):
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
             # overlap qk norm
-            if self.alt_stream is not None and get_is_capture_mode():
+            # Debug: Skip RMSNorm to test if it causes non-determinism
+            if get_bool_env_var("SGLANG_DEBUG_SKIP_RMSNORM"):
+                # Skip normalization, use values as-is
+                pass
+            elif self.alt_stream is not None and get_is_capture_mode():
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
@@ -1546,10 +1589,17 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             k_nope = latent_cache[..., : self.kv_lora_rank]
-            k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
+            # Debug: Skip RMSNorm in else branch too
+            if get_bool_env_var("SGLANG_DEBUG_SKIP_RMSNORM"):
+                k_nope = k_nope.unsqueeze(1)
+            else:
+                k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
 
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
+
+        # Debug: Check after q_proj/q_b_proj
+        self._check_duplicates_divergence_attn(q_nope.reshape(q_nope.shape[0], -1), "prepare_q_nope", forward_batch)
 
         if self.use_deep_gemm_bmm:
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
@@ -1603,14 +1653,23 @@ class DeepseekV2AttentionMLA(nn.Module):
                 q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
             )
         else:
-            q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
+            # Debug: Check input to torch.bmm (before bmm)
+            q_nope_transposed = q_nope.transpose(0, 1)
+            self._check_duplicates_divergence_attn(q_nope_transposed.transpose(0, 1).reshape(q_nope.shape[0], -1), "prepare_before_bmm_wkc", forward_batch)
+            
+            q_nope_out = torch.bmm(q_nope_transposed, self.w_kc)
 
         q_nope_out = q_nope_out.transpose(0, 1)
+        
+        # Debug: Check after torch.bmm with w_kc
+        self._check_duplicates_divergence_attn(q_nope_out.reshape(q_nope_out.shape[0], -1), "prepare_after_bmm_wkc", forward_batch)
 
         if not self._fuse_rope_for_trtllm_mla(forward_batch) and (
             not _use_aiter or not _is_gfx95_supported or self.use_nsa
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+            # Debug: Check after rotary embedding
+            self._check_duplicates_divergence_attn(q_pe.reshape(q_pe.shape[0], -1), "prepare_after_rope", forward_batch)
 
         topk_indices = None
         if q_lora is not None:
@@ -1687,6 +1746,10 @@ class DeepseekV2AttentionMLA(nn.Module):
                 forward_batch,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
+        
+        # Debug: Check after attention computation
+        self._check_duplicates_divergence_attn(attn_output.reshape(attn_output.shape[0], -1), "core_after_attn_mqa", forward_batch)
+        
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:
@@ -1756,19 +1819,30 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
             attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         else:
+            # Debug: Check input to torch.bmm with w_vc (before bmm)
+            attn_output_transposed = attn_output.transpose(0, 1)
+            self._check_duplicates_divergence_attn(attn_output_transposed.transpose(0, 1).reshape(attn_output.shape[0], -1), "core_before_bmm_wvc", None)
+            
             attn_bmm_output = torch.empty(
                 (attn_output.shape[0], self.num_local_heads * self.v_head_dim),
                 dtype=attn_output.dtype,
                 device=attn_output.device,
             )
             torch.bmm(
-                attn_output.transpose(0, 1),
+                attn_output_transposed,
                 self.w_vc,
                 out=attn_bmm_output.view(
                     -1, self.num_local_heads, self.v_head_dim
                 ).transpose(0, 1),
             )
+        
+        # Debug: Check after torch.bmm with w_vc
+        self._check_duplicates_divergence_attn(attn_bmm_output, "core_after_bmm_wvc", None)
+        
         output, _ = self.o_proj(attn_bmm_output)
+        
+        # Debug: Check after o_proj (final output)
+        self._check_duplicates_divergence_attn(output, "core_after_o_proj", None)
 
         return output
 
@@ -2474,6 +2548,53 @@ class DeepseekV2DecoderLayer(nn.Module):
             and layer_id % self.config.moe_layer_freq == 0
         )
 
+    def _check_duplicates_divergence(self, hidden_states: torch.Tensor, stage: str, forward_batch=None):
+        """
+        Debug: Simple check - compare all sequences when batch_size == 50.
+        Uses first dimension as batch size.
+        """
+        if not get_bool_env_var("SGLANG_DEBUG_CHECK_DUPLICATES"):
+            return
+        
+        batch_size = hidden_states.shape[0]
+        
+        # Only log when batch_size == 50
+        if batch_size != 50:
+            return
+        
+        # Compare all sequences with the first one
+        max_diff_overall = 0.0
+        mean_diff_overall = 0.0
+        max_pair = (0, 0)
+        
+        ref_seq = hidden_states[0]
+        
+        for i in range(1, batch_size):
+            curr_seq = hidden_states[i]
+            diff = torch.abs(ref_seq - curr_seq)
+            max_diff = torch.max(diff).item()
+            mean_diff = torch.mean(diff).item()
+            
+            if max_diff > max_diff_overall:
+                max_diff_overall = max_diff
+                mean_diff_overall = mean_diff
+                max_pair = (0, i)
+        
+        # Log to file
+        import json
+        divergence_log = {
+            "layer_id": self.layer_id,
+            "stage": stage,
+            "batch_size": batch_size,
+            "max_diff": float(max_diff_overall),
+            "mean_diff": float(mean_diff_overall),
+            "max_diff_pair": max_pair,
+            "is_divergent": max_diff_overall > 0.0  # Log any difference
+        }
+        
+        with open("divergence_log.jsonl", "a") as f:
+            f.write(json.dumps(divergence_log) + "\n")
+    
     def forward(
         self,
         positions: torch.Tensor,
@@ -2493,23 +2614,40 @@ class DeepseekV2DecoderLayer(nn.Module):
             else ""
         )
 
+        # Debug: Check input to layer
+        self._check_duplicates_divergence(hidden_states, "input", forward_batch)
+        
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
             forward_batch,
             quant_format,
         )
+        
+        # Debug: Check after input layernorm
+        self._check_duplicates_divergence(hidden_states, "after_input_ln", forward_batch)
 
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            zero_allocator=zero_allocator,
-        )
+        # Debug flag to skip attention and isolate MoE determinism
+        if get_bool_env_var("SGLANG_DEBUG_SKIP_ATTENTION"):
+            # Pass through input unchanged to test MoE layers only
+            pass
+        else:
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+            )
+        
+        # Debug: Check after attention
+        self._check_duplicates_divergence(hidden_states, "after_attention", forward_batch)
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        
+        # Debug: Check after post_attention_layernorm
+        self._check_duplicates_divergence(hidden_states, "after_post_attn_ln", forward_batch)
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -2525,13 +2663,21 @@ class DeepseekV2DecoderLayer(nn.Module):
         if isinstance(self.mlp, DeepseekV2MLP):
             gemm_output_zero_allocator = None
 
-        hidden_states = self.mlp(
-            hidden_states,
-            forward_batch,
-            should_allreduce_fusion,
-            use_reduce_scatter,
-            gemm_output_zero_allocator,
-        )
+        # Debug flag to skip MoE and isolate attention determinism
+        if get_bool_env_var("SGLANG_DEBUG_SKIP_MOE"):
+            # Pass through input unchanged to test attention layers only
+            pass
+        else:
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                should_allreduce_fusion,
+                use_reduce_scatter,
+                gemm_output_zero_allocator,
+            )
+        
+        # Debug: Check after MLP
+        self._check_duplicates_divergence(hidden_states, "after_mlp", forward_batch)
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -2540,6 +2686,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+        
+        # Debug: Check final output
+        self._check_duplicates_divergence(hidden_states, "output", forward_batch)
 
         return hidden_states, residual
 
