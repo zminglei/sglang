@@ -469,6 +469,58 @@ def mean_dim(
 def mm_batch_invariant(a, b):
     return matmul_persistent(a, b)
 
+def matmul_batch_invariant(a, b, *, out=None):
+    # torch.matmul can handle various dimensions
+    # For 2D x 2D, it's the same as mm
+    if a.ndim == 2 and b.ndim == 2:
+        result = matmul_persistent(a, b)
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
+    elif a.ndim == 3 and b.ndim == 3:
+        # Handle batched case like bmm
+        return bmm_batch_invariant(a, b, out=out)
+    else:
+        raise ValueError(
+            f"matmul_batch_invariant currently only supports 2D x 2D and 3D x 3D, "
+            f"got shapes {a.shape} and {b.shape}"
+        )
+
+def linear_batch_invariant(input, weight, bias=None):
+    output = mm_batch_invariant(input, weight.t())
+    if bias is not None:
+        output = output + bias
+    return output
+
+
+def bmm_batch_invariant(a, b, *, out=None):
+    # Batched matrix multiply: (B, M, K) x (B, K, N) -> (B, M, N)
+    # Process each batch separately with our persistent kernel
+    # Use pre-allocated tensor and sequential writes for full determinism
+    if a.ndim == 3 and b.ndim == 3:
+        B, M, K = a.shape
+        _, K2, N = b.shape
+        assert K == K2, f"Matrix dimensions don't match: {K} vs {K2}"
+        
+        # Pre-allocate output tensor
+        if out is None:
+            result = torch.empty((B, M, N), dtype=a.dtype, device=a.device)
+        else:
+            result = out
+        
+        # Process each batch sequentially and write directly to result tensor
+        # This avoids torch.stack which might have non-deterministic operations
+        for i in range(B):
+            batch_result = matmul_persistent(a[i], b[i])
+            result[i].copy_(batch_result)
+        
+        return result
+    else:
+        raise ValueError(
+            f"bmm_batch_invariant expects 3D tensors, got shapes {a.shape} and {b.shape}"
+        )
+
 
 def addmm_batch_invariant(bias, a, b):
     return matmul_persistent(a, b, bias=bias)
@@ -511,11 +563,19 @@ def enable_batch_invariant_mode():
     _batch_invariant_MODE = True
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
     _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, "CUDA")
+    _batch_invariant_LIB.impl("aten::bmm", bmm_batch_invariant, "CUDA")
     _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, "CUDA")
+    _batch_invariant_LIB.impl("aten::linear", linear_batch_invariant, "CUDA")
+    _batch_invariant_LIB.impl("aten::matmul", matmul_batch_invariant, "CUDA")
     _batch_invariant_LIB.impl(
         "aten::_log_softmax", _log_softmax_batch_invariant, "CUDA"
     )
     _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, "CUDA")
+    # Disable TF32 for batch invariance - it causes non-deterministic rounding
+    torch.bmm = bmm_batch_invariant
+    # Disable TF32 for batch invariance - it causes non-deterministic rounding
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
 
 
 def disable_batch_invariant_mode():

@@ -386,7 +386,7 @@ def fused_topk_torch_native(
         scores_for_choice = scores.view(
             -1, n_routed_experts
         ) + correction_bias.unsqueeze(0)
-        topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1, sorted=False)[1]
+        topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1, sorted=True)[1]
         topk_weights = scores.gather(1, topk_ids)
     else:
         assert (
@@ -398,7 +398,7 @@ def fused_topk_torch_native(
         )
         topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
         topk_weights = F.softmax(gating_output.float(), dim=-1)
-        topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
+        topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1, sorted=True)
 
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
@@ -493,7 +493,7 @@ def grouped_topk_gpu(
     group_scores = (
         scores.view(num_token, num_expert_group, -1).max(dim=-1).values
     )  # [n, n_group]
-    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
+    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=True)[
         1
     ]  # [n, top_k_group]
     group_mask = torch.zeros_like(group_scores)  # [n, n_group]
@@ -509,8 +509,7 @@ def grouped_topk_gpu(
         tmp_scores,
         k=topk,
         dim=-1,
-        sorted=(True if num_fused_shared_experts > 0 else False),
-    )
+        sorted=True)
     if num_fused_shared_experts:
         topk_ids[:, -1] = torch.randint(
             low=num_experts,
@@ -591,7 +590,7 @@ def biased_grouped_topk_impl(
         .topk(2, dim=-1)[0]
         .sum(dim=-1)
     )  # [n, n_group]
-    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
+    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=True)[
         1
     ]  # [n, top_k_group]
     group_mask = torch.zeros_like(group_scores)  # [n, n_group]
@@ -609,7 +608,7 @@ def biased_grouped_topk_impl(
         tmp_scores,
         k=topk,
         dim=-1,
-        sorted=(True if num_fused_shared_experts > 0 else False),
+        sorted=True
     )
     topk_weights = scores.gather(1, topk_ids)
 
