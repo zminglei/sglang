@@ -630,6 +630,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         conv_states = mamba_cache_params.conv
         ssm_states = mamba_cache_params.temporal
+        
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
             intermediate_state_cache = mamba_cache_params.intermediate_ssm
@@ -716,7 +717,32 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_parent_token=retrieve_parent_token,
             )
         else:
+            # FIX: Zero-initialize cache slots for sequences without prefix cache
+            # This ensures deterministic behavior for fresh sequences while still supporting
+            # prefix caching for sequences that have prior context.
+            if hasattr(forward_batch, 'extend_prefix_lens'):
+                # Check which sequences have no prefix (fresh sequences)
+                no_prefix_mask = forward_batch.extend_prefix_lens == 0
+                
+                if no_prefix_mask.any():
+                    # Zero out cache slots for sequences without prefix directly in the cache
+                    ssm_states[cache_indices[no_prefix_mask]] = 0
+            
             recurrent_state = ssm_states[cache_indices]
+            
+            # DEBUG: Log initial state to verify it's identical for all sequences
+            import os
+            if os.environ.get("ENABLE_DETERMINISM_LOGGING", "0") == "1":
+                with open(os.environ.get("DETERMINISM_LOG_FILE", "/tmp/qwen3_determinism_2.log"), "a") as f:
+                    if recurrent_state.shape[0] > 1:
+                        ref = recurrent_state[0]
+                        all_equal = all(torch.equal(ref, recurrent_state[i]) for i in range(1, recurrent_state.shape[0]))
+                        if not all_equal:
+                            diffs = [(recurrent_state[i] - ref).abs().max().item() for i in range(1, recurrent_state.shape[0])]
+                            f.write(f"\n[EXTEND:initial_state] NOT EQUAL! max_diffs={diffs}, extend_prefix_lens={forward_batch.extend_prefix_lens.tolist() if hasattr(forward_batch, 'extend_prefix_lens') else 'N/A'}\n")
+                        else:
+                            f.write(f"\n[EXTEND:initial_state] All equal across {recurrent_state.shape[0]} sequences\n")
+            
             core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                 q=query,
                 k=key,
@@ -729,6 +755,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
             )
+            
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             ssm_states[cache_indices] = last_recurrent_state
 

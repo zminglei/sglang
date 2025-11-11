@@ -34,12 +34,105 @@ def chunk_gated_delta_rule_fwd(
     output_final_state: bool,
     cu_seqlens: Optional[torch.LongTensor] = None,
 ):
+    import os
+    enable_determinism_logging = os.environ.get("ENABLE_DETERMINISM_LOGGING", "0") == "1"
+    log_file = os.environ.get("DETERMINISM_LOG_FILE", "/tmp/qwen3_determinism_2.log")
+    
+    def log_chunk_tensor(tensor, name, cu_seqlens):
+        """Log differences among sequences in chunk_gated_delta_rule_fwd"""
+        if not enable_determinism_logging or tensor is None:
+            return
+        
+        try:
+            # Special handling for final_state which has shape [N, H, K, V]
+            # where N is number of sequences (not concatenated)
+            if "final_state" in name and len(tensor.shape) == 4:
+                num_seqs = tensor.shape[0]
+                sequences = [tensor[i:i+1] for i in range(num_seqs)]
+            # If cu_seqlens is provided, we have multiple sequences concatenated
+            elif cu_seqlens is not None and len(cu_seqlens) > 2:
+                num_seqs = len(cu_seqlens) - 1
+                
+                # Extract each sequence
+                sequences = []
+                for i in range(num_seqs):
+                    start = cu_seqlens[i].item()
+                    end = cu_seqlens[i + 1].item()
+                    
+                    if len(tensor.shape) == 3:  # [1, total_seq, H] or [1, total_seq, dim]
+                        seq = tensor[:, start:end, :]
+                    elif len(tensor.shape) == 4:  # [1, total_seq, H, D]
+                        seq = tensor[:, start:end, :, :]
+                    elif len(tensor.shape) == 5:  # [1, num_chunks, H, chunk_size, D]
+                        # For chunked tensors, this is more complex
+                        seq = tensor  # Just use as-is for now
+                    else:
+                        return
+                    
+                    sequences.append(seq)
+            else:
+                return
+                
+                # Compare all sequences against the first
+                if len(sequences) > 1:
+                    reference = sequences[0]
+                    max_diff = 0.0
+                    all_equal = True
+                    
+                    for i in range(1, len(sequences)):
+                        if sequences[i].shape == reference.shape:
+                            diff = (sequences[i] - reference).abs().max().item()
+                            if diff > 0:
+                                all_equal = False
+                            max_diff = max(max_diff, diff)
+                    
+                    # Try to count unique sequences
+                    unique_count = "N/A"
+                    try:
+                        stacked = torch.stack([s.reshape(-1) for s in sequences])
+                        unique_count = len(torch.unique(stacked, dim=0))
+                    except:
+                        pass
+                    
+                    min_val = tensor.min().item()
+                    max_val = tensor.max().item()
+                    
+                    with open(log_file, "a") as f:
+                        f.write(f"  [chunk_internal:{name}] shape={tensor.shape}, num_seqs={num_seqs}\n")
+                        f.write(f"    max_diff={max_diff:.10e}, min={min_val:.6f}, max={max_val:.6f}\n")
+                        f.write(f"    unique_seqs={unique_count}/{num_seqs}, all_equal={all_equal}\n")
+                        if not all_equal:
+                            f.write(f"    ⚠️⚠️  NON-DETERMINISTIC IN CHUNK_GATED_DELTA_RULE!\n")
+                        f.write("\n")
+        except Exception as e:
+            with open(log_file, "a") as f:
+                f.write(f"  [chunk_internal:{name}] Error logging: {str(e)}\n\n")
+    
+    if enable_determinism_logging:
+        with open(log_file, "a") as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"CHUNK_GATED_DELTA_RULE_FWD - Internal Steps\n")
+            f.write(f"{'='*60}\n\n")
+    
+    # Log inputs
+    log_chunk_tensor(q, "input_q", cu_seqlens)
+    log_chunk_tensor(k, "input_k", cu_seqlens)
+    log_chunk_tensor(v, "input_v", cu_seqlens)
+    log_chunk_tensor(g, "input_g", cu_seqlens)
+    log_chunk_tensor(beta, "input_beta", cu_seqlens)
+    
     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
+    log_chunk_tensor(g, "after_cumsum_g", cu_seqlens)
+    
     # obtain WY representation. u is actually the new v.
     A = chunk_scaled_dot_kkt_fwd(
         k=k, beta=beta, g_cumsum=g, cu_seqlens=cu_seqlens, output_dtype=torch.float32
     )
+    log_chunk_tensor(A, "after_scaled_dot_kkt_A", cu_seqlens)
+    
     A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
+    log_chunk_tensor(A, "after_solve_tril_A", cu_seqlens)
+    
     w, u = recompute_w_u_fwd(
         k=k,
         v=v,
@@ -48,6 +141,9 @@ def chunk_gated_delta_rule_fwd(
         g_cumsum=g,
         cu_seqlens=cu_seqlens,
     )
+    log_chunk_tensor(w, "after_recompute_w", cu_seqlens)
+    log_chunk_tensor(u, "after_recompute_u", cu_seqlens)
+    
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
@@ -57,6 +153,10 @@ def chunk_gated_delta_rule_fwd(
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
     )
+    log_chunk_tensor(h, "after_fwd_h_h", cu_seqlens)
+    log_chunk_tensor(v_new, "after_fwd_h_v_new", cu_seqlens)
+    log_chunk_tensor(final_state, "after_fwd_h_final_state", cu_seqlens)
+    
     o = chunk_fwd_o(
         q=q,
         k=k,
@@ -66,6 +166,8 @@ def chunk_gated_delta_rule_fwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
     )
+    log_chunk_tensor(o, "after_fwd_o_output", cu_seqlens)
+    
     if SUPPRESS_LEVEL < 3:
         return g, o, A, final_state, None, None, None
     elif SUPPRESS_LEVEL >= 3:

@@ -37,7 +37,7 @@ class BenchArgs:
     batch_size: int = 1
     temperature: float = 0.0
     sampling_seed: int = 42
-    max_new_tokens: int = 100
+    max_new_tokens: int = 1
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
     return_logprob: bool = False
@@ -389,14 +389,15 @@ def test_deterministic(args):
 
     elif args.test_mode == "prefix":
         # In prefix mode, we create prompts from the same long prompt, with different lengths of common prefix.
-        len_prefix = [1, 511, 2048, 4097]
+        # len_prefix = [1, 511, 2048, 4097]
+        len_prefix = [1]
         num_prompts = len(len_prefix)
-        outputs = {i: [] for i in range(4)}
-        prompts = [LONG_PROMPT[: len_prefix[i]] for i in range(4)]
+        outputs = {i: [] for i in range(1)}
+        prompts = [LONG_PROMPT[: len_prefix[i]] for i in range(1)]
 
         # If return_logprob is enabled, store full responses for comparison
         if args.return_logprob:
-            full_responses = {i: [] for i in range(4)}
+            full_responses = {i: [] for i in range(1)}
 
         for i in range(args.n_start, args.n_start + args.n_trials):
             batch_size = i

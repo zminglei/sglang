@@ -10,6 +10,7 @@ import triton.language as tl
 
 from sglang.srt.layers.attention.fla.op import exp
 from sglang.srt.layers.attention.fla.utils import input_guard
+from sglang.srt.server_args import get_global_server_args
 
 
 @triton.heuristics(
@@ -577,7 +578,12 @@ def fused_recurrent_gated_delta_rule_update_fwd(
     else:
         stride_retrieve_parent_token_seq = stride_retrieve_parent_token_token = 0
 
-    NP2_T = triton.next_power_of_2(T)
+    # Use fixed NP2_T for deterministic execution to avoid recompilation for different sequence lengths
+    if get_global_server_args().enable_deterministic_inference:
+        NP2_T = 128  # Fixed value for determinism
+    else:
+        NP2_T = triton.next_power_of_2(T)
+    
     fused_recurrent_gated_delta_rule_update_fwd_kernel[grid](
         q=q,
         k=k,

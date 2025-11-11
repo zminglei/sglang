@@ -441,10 +441,12 @@ class Qwen3GatedDeltaNet(nn.Module):
             core_attn_out = core_attn_out_pad
 
         core_attn_out = self.norm(core_attn_out, z)
+        
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
         output, _ = self.out_proj(core_attn_out)
+        
         return output
 
 
@@ -519,6 +521,8 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 hidden_states,
                 forward_batch,
             )
+            pass
+
         # Fully Connected
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch

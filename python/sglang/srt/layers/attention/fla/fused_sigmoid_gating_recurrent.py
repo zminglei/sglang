@@ -198,7 +198,7 @@ def fused_sigmoid_gating_delta_rule_update(
     else:
         assert scale > 0, "scale must be positive"
 
-    o = q.new_empty(NK, *v.shape)
+    o = q.new_zeros(NK, *v.shape)
     grid = (NK, NV, N * HV)
 
     fused_sigmoid_gating_delta_rule_update_kernel[grid](

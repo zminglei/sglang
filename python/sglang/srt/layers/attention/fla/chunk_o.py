@@ -141,7 +141,10 @@ def chunk_fwd_o(
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
+    
+    # Use fixed chunk size for deterministic execution (always 64 for GDN)
+    BT = chunk_size  # Always 64 in practice for Qwen3-Next
+    
     chunk_indices = (
         prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     )
@@ -151,8 +154,12 @@ def chunk_fwd_o(
 
     o = torch.empty_like(v)
 
-    def grid(meta):
-        return (triton.cdiv(V, meta["BV"]), NT, B * H)
+    # Fixed block sizes for deterministic execution
+    BK_FIXED = 128
+    BV_FIXED = 64
+    
+    # Use fixed grid without meta parameter to avoid autotuning
+    grid = (triton.cdiv(V, BV_FIXED), NT, B * H)
 
     chunk_fwd_kernel_o[grid](
         q,
@@ -170,8 +177,8 @@ def chunk_fwd_o(
         K=K,
         V=V,
         BT=BT,
-        BK=128,
-        BV=64,
+        BK=BK_FIXED,
+        BV=BV_FIXED,
         num_warps=4,
         num_stages=2,
     )
