@@ -717,10 +717,23 @@ class CudaGraphRunner:
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
 
-        for _ in range(2):
+        # Track memory during warmup runs to identify peak usage
+        for i in range(2):
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
+            
+            if i == 0:  # Profile first warmup only
+                torch.cuda.reset_peak_memory_stats()
+                mem_before = torch.cuda.memory_allocated() / 1e9
+                logger.info(f"[Peak MEM] Before forward (bs={bs}): {mem_before:.3f} GB")
+            
             run_once()
+            
+            if i == 0:
+                mem_after = torch.cuda.memory_allocated() / 1e9
+                mem_peak = torch.cuda.max_memory_allocated() / 1e9
+                peak_overhead = mem_peak - mem_after
+                logger.info(f"[Peak MEM] After forward: allocated={mem_after:.3f} GB, peak={mem_peak:.3f} GB, overhead={peak_overhead:.3f} GB")
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())

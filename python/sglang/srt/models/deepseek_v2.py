@@ -2065,6 +2065,11 @@ class DeepseekV2AttentionMLA(nn.Module):
                     "llama_4_scaling": llama_4_scaling,
                 }
 
+            if get_bool_env_var("SGLANG_DEBUG_MEM_PEAK"):
+                torch.cuda.synchronize()
+                mem_before_attn_mqa = torch.cuda.memory_allocated() / 1e9
+                peak_before_attn_mqa = torch.cuda.max_memory_allocated() / 1e9
+
             attn_output = self.attn_mqa(
                 q_nope_out,
                 k_nope,
@@ -2075,6 +2080,12 @@ class DeepseekV2AttentionMLA(nn.Module):
                 **extra_args,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
+
+            if get_bool_env_var("SGLANG_DEBUG_MEM_PEAK"):
+                torch.cuda.synchronize()
+                mem_after_attn_mqa = torch.cuda.memory_allocated() / 1e9
+                peak_after_attn_mqa = torch.cuda.max_memory_allocated() / 1e9
+                logger.info(f"[Peak MEM]   attn_mqa call: {mem_after_attn_mqa:.3f} GB, peak: {peak_after_attn_mqa:.3f} GB, delta_peak: +{peak_after_attn_mqa - peak_before_attn_mqa:.3f} GB")
         else:
             if _use_aiter_gfx95:
                 cos = self.rotary_emb.cos_cache
@@ -2119,6 +2130,11 @@ class DeepseekV2AttentionMLA(nn.Module):
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+
+        if get_bool_env_var("SGLANG_DEBUG_MEM_PEAK"):
+            torch.cuda.synchronize()
+            mem_before_bmm = torch.cuda.memory_allocated() / 1e9
+            peak_before_bmm = torch.cuda.max_memory_allocated() / 1e9
 
         if self.use_deep_gemm_bmm:
             attn_output_val, attn_output_scale, masked_m, expected_m, aligned_m = (
@@ -2225,6 +2241,15 @@ class DeepseekV2AttentionMLA(nn.Module):
                     ).transpose(0, 1),
                 )
         output, _ = self.o_proj(attn_bmm_output)
+
+        if get_bool_env_var("SGLANG_DEBUG_MEM_PEAK"):
+            torch.cuda.synchronize()
+            mem_after_bmm = torch.cuda.memory_allocated() / 1e9
+            peak_after_bmm = torch.cuda.max_memory_allocated() / 1e9
+            logger.info(f"[Peak MEM]   BMM w_vc: {mem_after_bmm:.3f} GB, peak: {peak_after_bmm:.3f} GB, delta_peak: +{peak_after_bmm - peak_before_bmm:.3f} GB")
+            mem_after_o_proj = torch.cuda.memory_allocated() / 1e9
+            peak_after_o_proj = torch.cuda.max_memory_allocated() / 1e9
+            logger.info(f"[Peak MEM]   o_proj: {mem_after_o_proj:.3f} GB, peak: {peak_after_o_proj:.3f} GB, delta_peak: +{peak_after_o_proj - peak_after_bmm:.3f} GB")
 
         return output
 
@@ -2893,12 +2918,18 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
         )
 
+        if get_bool_env_var("SGLANG_TRACK_PEAK_MEM") and self.layer_id == 0:
+            logger.info(f"[Peak MEM] Layer {self.layer_id} - before prepare_attn: {torch.cuda.memory_allocated()/1e9:.3f} GB, peak: {torch.cuda.max_memory_allocated()/1e9:.3f} GB")
+        
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
             forward_batch,
             quant_format,
         )
+
+        if get_bool_env_var("SGLANG_TRACK_PEAK_MEM") and self.layer_id == 0:
+            logger.info(f"[Peak MEM] Layer {self.layer_id} - after prepare_attn: {torch.cuda.memory_allocated()/1e9:.3f} GB, peak: {torch.cuda.max_memory_allocated()/1e9:.3f} GB")
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -2908,9 +2939,15 @@ class DeepseekV2DecoderLayer(nn.Module):
             llama_4_scaling=llama_4_scaling,
         )
 
+        if get_bool_env_var("SGLANG_TRACK_PEAK_MEM") and self.layer_id == 0:
+            logger.info(f"[Peak MEM] Layer {self.layer_id} - after self_attn: {torch.cuda.memory_allocated()/1e9:.3f} GB, peak: {torch.cuda.max_memory_allocated()/1e9:.3f} GB")
+
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+
+        if get_bool_env_var("SGLANG_TRACK_PEAK_MEM") and self.layer_id == 0:
+            logger.info(f"[Peak MEM] Layer {self.layer_id} - after prepare_mlp: {torch.cuda.memory_allocated()/1e9:.3f} GB, peak: {torch.cuda.max_memory_allocated()/1e9:.3f} GB")
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -2933,6 +2970,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             use_reduce_scatter,
             gemm_output_zero_allocator,
         )
+
+        if get_bool_env_var("SGLANG_TRACK_PEAK_MEM") and self.layer_id == 0:
+            logger.info(f"[Peak MEM] Layer {self.layer_id} - after mlp: {torch.cuda.memory_allocated()/1e9:.3f} GB, peak: {torch.cuda.max_memory_allocated()/1e9:.3f} GB")
 
         if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -3176,6 +3216,9 @@ class DeepseekV2Model(nn.Module):
             else:
                 hidden_states = input_embeds
             residual = None
+            if get_bool_env_var("SGLANG_TRACE_PEAK_MEM"):
+                torch.cuda.synchronize()
+                logger.info(f"[Peak MEM] After embed: {torch.cuda.memory_allocated()/1e9:.3f} GB, peak: {torch.cuda.max_memory_allocated()/1e9:.3f} GB")
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
@@ -3233,6 +3276,9 @@ class DeepseekV2Model(nn.Module):
                     gemm_output_zero_allocator,
                     llama_4_scaling,
                 )
+                if get_bool_env_var("SGLANG_TRACE_PEAK_MEM") and i % 6 == 0:
+                    torch.cuda.synchronize()
+                    logger.info(f"[Peak MEM] After layer_{i}: {torch.cuda.memory_allocated()/1e9:.3f} GB, peak: {torch.cuda.max_memory_allocated()/1e9:.3f} GB")
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -3261,6 +3307,9 @@ class DeepseekV2Model(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
+                if get_bool_env_var("SGLANG_TRACE_PEAK_MEM"):
+                    torch.cuda.synchronize()
+                    logger.info(f"[Peak MEM] After norm: {torch.cuda.memory_allocated()/1e9:.3f} GB, peak: {torch.cuda.max_memory_allocated()/1e9:.3f} GB")
 
         if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
             # allgather + rerrange

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
+import logging
 import numpy as np
 import torch
 import triton
@@ -15,7 +16,9 @@ from sglang.srt.mem_cache.memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils import get_compiler_backend, get_bool_env_var
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -1217,6 +1220,11 @@ class FlashAttentionBackend(AttentionBackend):
                     o = result
         else:
             # Do absorbed multi-latent attention
+            if get_bool_env_var("SGLANG_DEBUG_MEM_PEAK"):
+                torch.cuda.synchronize()
+                mem_before_kv_cache = torch.cuda.memory_allocated() / 1e9
+                peak_before_kv_cache = torch.cuda.max_memory_allocated() / 1e9
+
             kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
                 q.dtype
             )
@@ -1232,6 +1240,12 @@ class FlashAttentionBackend(AttentionBackend):
                 -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
             )
 
+            if get_bool_env_var("SGLANG_DEBUG_MEM_PEAK"):
+                torch.cuda.synchronize()
+                mem_after_kv_reshape = torch.cuda.memory_allocated() / 1e9
+                peak_after_kv_reshape = torch.cuda.max_memory_allocated() / 1e9
+                logger.info(f"[Peak MEM]     FA backend: after get_key_buffer & reshape: {mem_after_kv_reshape:.3f} GB, peak: {peak_after_kv_reshape:.3f} GB, delta_peak: +{peak_after_kv_reshape - peak_before_kv_cache:.3f} GB")
+
             if q_rope is not None:
                 q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
                 q_rope = q_rope.view(
@@ -1242,6 +1256,12 @@ class FlashAttentionBackend(AttentionBackend):
                 q_nope = q_all[:, :, : layer.v_head_dim]
                 q_rope = q_all[:, :, layer.v_head_dim :]
             max_seqlen_q = metadata.max_seq_len_q
+
+            if get_bool_env_var("SGLANG_DEBUG_MEM_PEAK"):
+                torch.cuda.synchronize()
+                mem_before_fa3 = torch.cuda.memory_allocated() / 1e9
+                peak_before_fa3 = torch.cuda.max_memory_allocated() / 1e9
+                logger.info(f"[Peak MEM]     FA backend: before flash_attn_with_kvcache (FA3): {mem_before_fa3:.3f} GB, peak: {peak_before_fa3:.3f} GB")
 
             result = flash_attn_with_kvcache(
                 q=q_rope,
@@ -1261,6 +1281,13 @@ class FlashAttentionBackend(AttentionBackend):
                 return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
                 num_splits=self.num_splits,
             )
+
+            if get_bool_env_var("SGLANG_DEBUG_MEM_PEAK"):
+                torch.cuda.synchronize()
+                mem_after_fa3 = torch.cuda.memory_allocated() / 1e9
+                peak_after_fa3 = torch.cuda.max_memory_allocated() / 1e9
+                logger.info(f"[Peak MEM]     FA backend: after flash_attn_with_kvcache (FA3): {mem_after_fa3:.3f} GB, peak: {peak_after_fa3:.3f} GB, delta_peak: +{peak_after_fa3 - peak_before_fa3:.3f} GB")
+
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
