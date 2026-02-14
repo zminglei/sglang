@@ -2159,6 +2159,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if hasattr(layer, "self_attn"):
                 if hasattr(layer.self_attn, "attn"):
                     self.attention_layers.append(layer.self_attn.attn)
+                elif hasattr(layer.self_attn, "linear_attn"):
+                    self.attention_layers.append(layer.self_attn.linear_attn)
                 elif hasattr(layer.self_attn, "attn_mqa"):
                     # For DeepSeek model
                     self.attention_layers.append(layer.self_attn.attn_mqa)

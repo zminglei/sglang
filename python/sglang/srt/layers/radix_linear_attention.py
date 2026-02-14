@@ -76,14 +76,27 @@ class RadixLinearAttention(nn.Module):
     ) -> torch.Tensor:
         if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
             # Output shape from linear attention: (1, seq_len, num_v_heads, head_v_dim)
-            seq_len = mixed_qkv.shape[0]
+            # Handle both tuple of tensors and single concatenated tensor
+            if isinstance(mixed_qkv, tuple):
+                # Concatenate q, k, v into a single tensor for the custom op
+                # PyTorch custom ops don't support Union types with tuples
+                mixed_qkv_tensor = torch.cat(mixed_qkv, dim=-1)
+                first_tensor = mixed_qkv[0]
+                seq_len, _ = first_tensor.shape
+                dtype = first_tensor.dtype
+                device = first_tensor.device
+            else:
+                mixed_qkv_tensor = mixed_qkv
+                seq_len, _ = mixed_qkv.shape
+                dtype = mixed_qkv.dtype
+                device = mixed_qkv.device
             output = torch.empty(
                 (1, seq_len, self.num_v_heads, self.head_v_dim),
-                dtype=mixed_qkv.dtype,
-                device=mixed_qkv.device,
+                dtype=dtype,
+                device=device,
             )
             unified_linear_attention_with_output(
-                mixed_qkv,
+                mixed_qkv_tensor,
                 a,
                 b,
                 output,
@@ -111,6 +124,7 @@ def unified_linear_attention_with_output(
 ) -> None:
     """
     Custom op wrapper for linear attention computation only.
+    mixed_qkv should be a single concatenated tensor of q, k, v.
     """
     context = get_forward_context()
     forward_batch = context.forward_batch
