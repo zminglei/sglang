@@ -23,7 +23,6 @@ import torch.nn as nn
 from einops import rearrange
 
 # Model Executor
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 
 # Configs
 from sglang.srt.configs.qwen3_5 import (
@@ -247,7 +246,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         raise NotImplementedError(
             "Qwen3.5 Series dont need to fix query key value ordering"
         )
-        
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -685,6 +684,7 @@ class Qwen3_5ForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,

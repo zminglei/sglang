@@ -5,8 +5,6 @@ from typing import Any, Iterable, Optional, Set, Tuple
 import torch
 from torch import nn
 
-from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -53,7 +51,6 @@ from sglang.srt.utils import (
     make_layers,
     set_weight_attrs,
 )
-from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
