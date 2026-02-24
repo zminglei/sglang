@@ -75,9 +75,6 @@ from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.utils import add_prefix, is_cuda, is_npu, make_layers, set_weight_attrs
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
-# Model Executor
-
-
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
