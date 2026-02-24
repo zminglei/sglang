@@ -72,7 +72,6 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
 
 # Models
-from sglang.srt.models.qwen3_next import gdn_with_output
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 
 # Utils
@@ -248,24 +247,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         raise NotImplementedError(
             "Qwen3.5 Series dont need to fix query key value ordering"
         )
-
+        
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ):
-        output = torch.empty_like(hidden_states)
-        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
-            gdn_with_output(
-                hidden_states,
-                output,
-                self.layer_id,
-            )
-            return output
-        else:
-            return self._forward(hidden_states, forward_batch)
-
-    def _forward(
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
@@ -287,7 +270,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         b = b.contiguous()
         a = a.contiguous()
 
-        core_attn_out = self.attn.forward(
+        core_attn_out = self.attn(
             forward_batch=forward_batch,
             mixed_qkv=mixed_qkv,
             a=a,
@@ -702,7 +685,6 @@ class Qwen3_5ForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
-    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,

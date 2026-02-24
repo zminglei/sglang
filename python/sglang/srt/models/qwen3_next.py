@@ -1149,25 +1149,3 @@ class Qwen3NextForCausalLM(nn.Module):
 
 
 EntryClass = Qwen3NextForCausalLM
-
-
-@register_custom_op(mutates_args=["output"])
-@register_split_op()
-def gdn_with_output(
-    hidden_states: torch.Tensor,
-    output: torch.Tensor,
-    layer_id: int,
-) -> None:
-    context = get_forward_context()
-    forward_batch = context.forward_batch
-    attention_layers = context.attention_layers
-    attention_layer = attention_layers[layer_id]
-
-    ret = attention_layer._forward(hidden_states, forward_batch)
-
-    assert (
-        output.numel() == ret.numel()
-    ), f"Output tensor element mismatch: {output.numel()} != {ret.numel()}"
-
-    output.view(ret.shape).copy_(ret)
-    return
