@@ -25,9 +25,6 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     cu_seqlens,
     scale,
     T,
-    stride_q,
-    stride_k,
-    stride_v,
     B: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
@@ -57,9 +54,9 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     o_k = i_k * BK + tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
 
-    p_q = q + bos * stride_q + i_h * K + o_k
-    p_k = k + bos * stride_k + i_h * K + o_k
-    p_v = v + bos * stride_v + i_hv * V + o_v
+    p_q = q + (bos * H + i_h) * K + o_k
+    p_k = k + (bos * H + i_h) * K + o_k
+    p_v = v + (bos * HV + i_hv) * V + o_v
     if IS_BETA_HEADWISE:
         p_beta = beta + (bos * HV + i_hv) * V + o_v
     else:
@@ -109,10 +106,10 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         b_o = tl.sum(b_h * b_q[:, None], 0)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
-        p_q += stride_q
-        p_k += stride_k
+        p_q += H * K
+        p_k += H * K
         p_o += HV * V
-        p_v += stride_v
+        p_v += HV * V
         if not IS_KDA:
             p_g += HV
         else:
@@ -164,9 +161,6 @@ def fused_recurrent_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         scale=scale,
         T=T,
-        stride_q=q.stride(1),
-        stride_k=k.stride(1),
-        stride_v=v.stride(1),
         B=B,
         H=H,
         HV=HV,
@@ -190,7 +184,7 @@ def fused_recurrent_gated_delta_rule_fwd(
 class FusedRecurrentFunction(torch.autograd.Function):
 
     @staticmethod
-    @input_guard(no_guard_contiguous=["q", "k", "v"])
+    @input_guard
     def forward(
         ctx,
         q: torch.Tensor,
@@ -365,9 +359,6 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     stride_retrieve_parent_token_seq: tl.constexpr,
     stride_retrieve_parent_token_token: tl.constexpr,
     T,
-    stride_q,
-    stride_k,
-    stride_v,
     NP2_T: tl.constexpr,
     B: tl.constexpr,
     H: tl.constexpr,
@@ -400,9 +391,9 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     o_k = i_k * BK + tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
 
-    p_q = q + bos * stride_q + i_h * K + o_k
-    p_k = k + bos * stride_k + i_h * K + o_k
-    p_v = v + bos * stride_v + i_hv * V + o_v
+    p_q = q + (bos * H + i_h) * K + o_k
+    p_k = k + (bos * H + i_h) * K + o_k
+    p_v = v + (bos * HV + i_hv) * V + o_v
     if IS_BETA_HEADWISE:
         p_beta = beta + (bos * HV + i_hv) * V + o_v
     else:
@@ -506,10 +497,10 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
 
         step_idx += 1
 
-        p_q += stride_q
-        p_k += stride_k
+        p_q += H * K
+        p_k += H * K
         p_o += HV * V
-        p_v += stride_v
+        p_v += HV * V
         p_g += HV
         p_beta += HV * (V if IS_BETA_HEADWISE else 1)
 
@@ -591,9 +582,6 @@ def fused_recurrent_gated_delta_rule_update_fwd(
         stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
         stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,
         T=T,
-        stride_q=q.stride(1),
-        stride_k=k.stride(1),
-        stride_v=v.stride(1),
         NP2_T=NP2_T,
         B=B,
         H=H,
@@ -620,7 +608,7 @@ def fused_recurrent_gated_delta_rule_update_fwd(
 class FusedRecurrentUpdateFunction(torch.autograd.Function):
 
     @staticmethod
-    @input_guard(no_guard_contiguous=["q", "k", "v"])
+    @input_guard
     def forward(
         ctx,
         q: torch.Tensor,

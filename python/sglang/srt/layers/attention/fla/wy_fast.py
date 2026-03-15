@@ -35,9 +35,6 @@ def recompute_w_u_fwd_kernel(
     Hg: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
-    S_V_T: tl.constexpr,
-    S_V_H: tl.constexpr,
-    S_V_K: tl.constexpr,
     BT: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
@@ -68,9 +65,9 @@ def recompute_w_u_fwd_kernel(
 
     for i_v in range(tl.cdiv(V, BV)):
         p_v = tl.make_block_ptr(
-            v + bos * S_V_T + i_h * S_V_H,
+            v + (bos * H + i_h) * V,
             (T, V),
-            (S_V_T, S_V_K),
+            (H * V, 1),
             (i_t * BT, i_v * BV),
             (BT, BV),
             (1, 0),
@@ -129,18 +126,8 @@ def recompute_w_u_fwd(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     BK = 64
     BV = 64
-    u = torch.empty(B, T, H, V, dtype=v.dtype, device=v.device)
+    u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)
-    # v may be non-contiguous from torch.split on merged QKV buffer.
-    # Pass actual strides so the kernel reads v correctly without .contiguous().
-    if v.dim() >= 4:
-        S_V_T = v.stride(1)
-        S_V_H = v.stride(2)
-        S_V_K = v.stride(3)
-    else:
-        S_V_T = H * V
-        S_V_H = V
-        S_V_K = 1
     recompute_w_u_fwd_kernel[(NT, B * H)](
         k=k,
         v=v,
@@ -156,9 +143,6 @@ def recompute_w_u_fwd(
         Hg=Hg,
         K=K,
         V=V,
-        S_V_T=S_V_T,
-        S_V_H=S_V_H,
-        S_V_K=S_V_K,
         BT=BT,
         BK=BK,
         BV=BV,

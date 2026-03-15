@@ -3,13 +3,12 @@
 
 import contextlib
 import functools
-import inspect
 import logging
 import os
 import sys
 from enum import Enum
 from functools import lru_cache
-from typing import Any, Callable, Dict, Literal, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Literal, Optional, Tuple
 
 import torch
 import triton
@@ -132,80 +131,41 @@ def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]
     return wrapper
 
 
-def input_guard(
-    fn: Callable[..., torch.Tensor] = None,
-    *,
-    no_guard_contiguous: Union[bool, list] = False,
-) -> Callable[..., torch.Tensor]:
+def input_guard(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
     """
     A decorator to make sure all input tensors are contiguous and set the device based on input tensors.
-
-    Args:
-        no_guard_contiguous: If True, skip all contiguous checks. If a list of
-            parameter names, skip contiguous check for those parameters only.
     """
 
-    def decorator(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
-        sig = inspect.signature(fn)
-        param_names = list(sig.parameters.keys())
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        contiguous_args = (
+            i if not isinstance(i, torch.Tensor) else i.contiguous() for i in args
+        )
+        contiguous_kwargs = {
+            k: (v if not isinstance(v, torch.Tensor) else v.contiguous())
+            for k, v in kwargs.items()
+        }
 
-        @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
-            skip_params = set()
-            if isinstance(no_guard_contiguous, list):
-                skip_params = set(no_guard_contiguous)
-
-            processed_args = []
-            for i, arg in enumerate(args):
-                if i < len(param_names):
-                    param_name = param_names[i]
-                else:
-                    param_name = f"__arg_{i}"
-
-                if isinstance(arg, torch.Tensor):
-                    if no_guard_contiguous is True or param_name in skip_params:
-                        processed_args.append(arg)
-                    else:
-                        processed_args.append(arg.contiguous())
-                else:
-                    processed_args.append(arg)
-
-            processed_kwargs = {}
-            for k, v in kwargs.items():
-                if isinstance(v, torch.Tensor):
-                    if no_guard_contiguous is True or k in skip_params:
-                        processed_kwargs[k] = v
-                    else:
-                        processed_kwargs[k] = v.contiguous()
-                else:
-                    processed_kwargs[k] = v
-
-            tensor = None
-            for arg in args:
-                if isinstance(arg, torch.Tensor):
-                    tensor = arg
+        tensor = None
+        for arg in args:
+            if isinstance(arg, torch.Tensor):
+                tensor = arg
+                break
+        if tensor is None:
+            for value in kwargs.values():
+                if isinstance(value, torch.Tensor):
+                    tensor = value
                     break
-            if tensor is None:
-                for value in kwargs.values():
-                    if isinstance(value, torch.Tensor):
-                        tensor = value
-                        break
 
-            if tensor is not None:
-                ctx = custom_device_ctx(tensor.device.index)
-            else:
-                ctx = contextlib.nullcontext()
+        if tensor is not None:
+            ctx = custom_device_ctx(tensor.device.index)
+        else:
+            ctx = contextlib.nullcontext()
 
-            with ctx:
-                return fn(*processed_args, **processed_kwargs)
+        with ctx:
+            return fn(*contiguous_args, **contiguous_kwargs)
 
-        return wrapper
-
-    # Handle direct usage without parentheses: @input_guard
-    if fn is not None:
-        return decorator(fn)
-
-    return decorator
+    return wrapper
 
 
 contiguous = input_guard

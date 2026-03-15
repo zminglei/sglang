@@ -249,11 +249,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             dim=-1,
         )
         # Reshape from [bs, h*d] to [1, bs, h, d]
-        # No .contiguous() needed — fused_recurrent kernels are stride-aware.
         bs = forward_batch.batch_size
-        query = query.reshape(1, bs, layer.num_q_heads, layer.head_q_dim)
-        key = key.reshape(1, bs, layer.num_k_heads, layer.head_k_dim)
-        value = value.reshape(1, bs, layer.num_v_heads, layer.head_v_dim)
+        query = query.view(1, bs, layer.num_q_heads, layer.head_q_dim)
+        key = key.view(1, bs, layer.num_k_heads, layer.head_k_dim)
+        value = value.view(1, bs, layer.num_v_heads, layer.head_v_dim)
 
         core_attn_out = self.kernel_dispatcher.decode(
             q=query,
@@ -334,7 +333,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
             )
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2).reshape(seq_len, -1).contiguous()
+            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            # target_verify: use original split+view path
+            query, key, value = torch.split(
+                mixed_qkv, [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
+            actual_seq_len = query.shape[0]
+            query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
+            key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
+            value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if (
@@ -348,7 +354,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
                 conv_states[conv_dst[mask_indices]] = mixed_qkv_to_track
 
-            mixed_qkv = causal_conv1d_fn(
+            # conv_out: (total_dim, padded_T) contiguous. Keep channel-first
+            # to avoid the expensive transpose copy. Split on dim 0 (free views)
+            # and use fused l2norm that reads T-contiguous data.
+            conv_out = causal_conv1d_fn(
                 mixed_qkv,
                 layer.conv_weights,
                 layer.bias,
@@ -358,18 +367,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            ).transpose(0, 1)[:seq_len]
+            )
+            actual_seq_len = seq_len
+            q_raw = conv_out[:layer.q_dim]
+            k_raw = conv_out[layer.q_dim:layer.q_dim + layer.k_dim]
+            v_raw = conv_out[layer.q_dim + layer.k_dim:]
 
-        query, key, value = torch.split(
-            mixed_qkv,
-            [layer.q_dim, layer.k_dim, layer.v_dim],
-            dim=-1,
-        )
-
-        actual_seq_len = query.shape[0]
-        query = query.reshape(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
-        key = key.reshape(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
-        value = value.reshape(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+            from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd_packed
+            query = l2norm_fwd_packed(
+                q_raw, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
+            key = l2norm_fwd_packed(
+                k_raw, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
+            value = v_raw[:, :actual_seq_len].t().contiguous().view(
+                1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
         if is_target_verify:
             core_attn_out = self.kernel_dispatcher.target_verify(
@@ -390,12 +400,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            # l2norm already applied to q/k in fused l2norm_fwd_packed above
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
                 v=value,
                 g=g,
                 beta=beta,
+                use_qk_l2norm_in_kernel=False,
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
