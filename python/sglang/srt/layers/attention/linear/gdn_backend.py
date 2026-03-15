@@ -373,13 +373,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
             k_raw = conv_out[layer.q_dim:layer.q_dim + layer.k_dim]
             v_raw = conv_out[layer.q_dim + layer.k_dim:]
 
-            from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd_packed
+            from sglang.srt.layers.attention.fla.l2norm import (
+                l2norm_fwd_packed, extract_transpose_packed)
             query = l2norm_fwd_packed(
                 q_raw, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
             key = l2norm_fwd_packed(
                 k_raw, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
-            value = v_raw[:, :actual_seq_len].t().contiguous().view(
-                1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+            value = extract_transpose_packed(
+                v_raw, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
         if is_target_verify:
             core_attn_out = self.kernel_dispatcher.target_verify(
