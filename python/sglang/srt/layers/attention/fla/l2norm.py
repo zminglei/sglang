@@ -51,55 +51,44 @@ def l2norm_fwd_kernel_4d(
     H: tl.constexpr,
     K: tl.constexpr,
     BT: tl.constexpr,
-    BK: tl.constexpr,
+    BD: tl.constexpr,
     # Input strides (from the 4D tensor)
     S_X_T: tl.constexpr,   # stride along T dim (=1 for column-major)
     S_X_H: tl.constexpr,   # stride along H dim (=K*padded)
     S_X_K: tl.constexpr,   # stride along K dim (=padded)
 ):
-    i_bt = tl.program_id(0)  # T block index
-    i_h = tl.program_id(1)   # head index
+    # Grid: (cdiv(T, BT), H). Each program normalizes BT time steps for one head.
+    # Single-pass: load all K elements per time step, compute norm, normalize, store.
+    # K elements have stride S_X_K (non-contiguous), but BD is padded to power-of-2
+    # and we load all K at once — no 2-pass needed.
+    i_bt = tl.program_id(0)
+    i_h = tl.program_id(1)
 
     t_start = i_bt * BT
     t_off = tl.arange(0, BT)
     t_mask = (t_start + t_off) < T
 
-    # Base pointer for this head
     x_base = x + i_h * S_X_H
+    y_base = y + i_h * K
 
-    # Pass 1: accumulate sum of squares across K dim
-    b_var = tl.zeros([BT], dtype=tl.float32)
-    for i_k in range(tl.cdiv(K, BK)):
-        k_off = tl.arange(0, BK)
-        k_start = i_k * BK
-        k_mask = (k_start + k_off) < K
-        # Load (BK, BT) block: K has stride S_X_K, T has stride S_X_T (=1, coalesced!)
-        # Offsets: x_base + (k_start + k_off) * S_X_K + (t_start + t_off) * S_X_T
-        offs = (k_start + k_off[:, None]) * S_X_K + (t_start + t_off[None, :]) * S_X_T
-        mask = k_mask[:, None] & t_mask[None, :]
-        b_x = tl.load(x_base + offs, mask=mask, other=0.0).to(tl.float32)
-        b_var += tl.sum(b_x * b_x, axis=0)
+    k_off = tl.arange(0, BD)
+    k_mask = k_off < K
 
+    # Load all K elements for BT time steps in one shot: (BD, BT)
+    offs_x = k_off[:, None] * S_X_K + (t_start + t_off[None, :]) * S_X_T
+    mask = k_mask[:, None] & t_mask[None, :]
+    b_x = tl.load(x_base + offs_x, mask=mask, other=0.0).to(tl.float32)
+
+    # L2 norm: reduce over K (axis=0)
+    b_var = tl.sum(b_x * b_x, axis=0)  # (BT,)
     b_rstd = 1.0 / tl.sqrt(b_var + eps)
 
-    # Pass 2: normalize and store to contiguous output (T, H, K)
-    # Output layout: y[(t * H + h) * K + k]
-    y_base = y + i_h * K  # offset for this head
+    # Normalize
+    b_y = b_x * b_rstd[None, :]
 
-    for i_k in range(tl.cdiv(K, BK)):
-        k_off = tl.arange(0, BK)
-        k_start = i_k * BK
-        k_mask = (k_start + k_off) < K
-        # Reload input (same coalesced pattern)
-        offs_x = (k_start + k_off[:, None]) * S_X_K + (t_start + t_off[None, :]) * S_X_T
-        mask = k_mask[:, None] & t_mask[None, :]
-        b_x = tl.load(x_base + offs_x, mask=mask, other=0.0).to(tl.float32)
-        b_y = b_x * b_rstd[None, :]
-
-        # Store to contiguous output: offset = (t_start + t_off) * H * K + i_h * K + k_start + k_off
-        # = y_base + (t_start + t_off) * H * K + k_start + k_off
-        offs_y = (t_start + t_off[None, :]) * (H * K) + (k_start + k_off[:, None])
-        tl.store(y_base + offs_y, b_y.to(y.dtype.element_ty), mask=mask)
+    # Store to contiguous output (T, H, K) layout
+    offs_y = (t_start + t_off[None, :]) * (H * K) + k_off[:, None]
+    tl.store(y_base + offs_y, b_y.to(y.dtype.element_ty), mask=mask)
 
 
 def l2norm_fwd(
@@ -109,12 +98,9 @@ def l2norm_fwd(
 
     # Detect 4D non-contiguous input from conv1d transpose+split+reshape.
     # Pattern: (1, T, H, K) with stride[-1] != 1 (column-major from transpose).
-    # Only use the stride-aware 4D kernel for long sequences (T >= 2048)
-    # where the copy savings exceed the 2-pass kernel overhead.
-    # For short sequences, fall through to standard path which copies but
-    # uses a faster single-pass kernel.
-    if (x.dim() == 4 and x.stride(-1) != 1 and x.stride(1) == 1
-            and x.shape[1] >= 2048):
+    # Use single-pass stride-aware kernel that loads all K at once and
+    # reads T-contiguous data (coalesced), fusing transpose into normalize.
+    if (x.dim() == 4 and x.stride(-1) != 1 and x.stride(1) == 1):
         # Use optimized 4D kernel that reads T-contiguous data
         B, T, H, K = x.shape
         assert B == 1, "4D l2norm only supports B=1"
@@ -122,13 +108,13 @@ def l2norm_fwd(
 
         y_flat = torch.empty(T * H, K, dtype=output_dtype or x.dtype, device=x.device)
 
-        BT = min(32, triton.next_power_of_2(T))
-        BK = min(64, triton.next_power_of_2(K))
+        BT = min(16, triton.next_power_of_2(T))
+        BD = triton.next_power_of_2(K)  # load all K at once, no 2-pass
 
         grid = (triton.cdiv(T, BT), H)
         l2norm_fwd_kernel_4d[grid](
             x, y_flat, eps,
-            T=T, H=H, K=K, BT=BT, BK=BK,
+            T=T, H=H, K=K, BT=BT, BD=BD,
             S_X_T=x.stride(1),
             S_X_H=x.stride(2),
             S_X_K=x.stride(3),
