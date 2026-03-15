@@ -75,7 +75,7 @@ def chunk_gated_delta_rule_fwd(
 class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
 
     @staticmethod
-    @input_guard
+    @input_guard(no_guard_contiguous=["q", "k", "v"])
     @autocast_custom_fwd
     def forward(
         ctx,

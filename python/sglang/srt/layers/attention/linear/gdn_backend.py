@@ -249,10 +249,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             dim=-1,
         )
         # Reshape from [bs, h*d] to [1, bs, h, d]
+        # No .contiguous() needed — fused_recurrent kernels are stride-aware.
         bs = forward_batch.batch_size
-        query = query.view(1, bs, layer.num_q_heads, layer.head_q_dim)
-        key = key.view(1, bs, layer.num_k_heads, layer.head_k_dim)
-        value = value.view(1, bs, layer.num_v_heads, layer.head_v_dim)
+        query = query.reshape(1, bs, layer.num_q_heads, layer.head_q_dim)
+        key = key.reshape(1, bs, layer.num_k_heads, layer.head_k_dim)
+        value = value.reshape(1, bs, layer.num_v_heads, layer.head_v_dim)
 
         core_attn_out = self.kernel_dispatcher.decode(
             q=query,
@@ -333,7 +334,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
             )
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            mixed_qkv = mixed_qkv_processed.transpose(1, 2).reshape(seq_len, -1).contiguous()
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if (
@@ -359,16 +360,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             ).transpose(0, 1)[:seq_len]
 
+        # No contiguous copies. split + reshape produce non-contiguous views.
+        # Downstream kernels (l2norm, recompute_w_u) are stride-aware and
+        # read non-contiguous data directly, eliminating all copy overhead.
+        actual_seq_len = mixed_qkv.shape[0]
         query, key, value = torch.split(
             mixed_qkv,
             [layer.q_dim, layer.k_dim, layer.v_dim],
             dim=-1,
         )
-
-        actual_seq_len = query.shape[0]
-        query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
-        key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
-        value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+        query = query.reshape(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
+        key = key.reshape(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
+        value = value.reshape(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
         if is_target_verify:
             core_attn_out = self.kernel_dispatcher.target_verify(
