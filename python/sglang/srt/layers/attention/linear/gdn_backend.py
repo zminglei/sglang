@@ -360,18 +360,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             ).transpose(0, 1)[:seq_len]
 
-        # No contiguous copies. split + reshape produce non-contiguous views.
-        # Downstream kernels (l2norm, recompute_w_u) are stride-aware and
-        # read non-contiguous data directly, eliminating all copy overhead.
+        # Extend path: column-major from conv1d transpose. K elements have
+        # stride padded_seq_len (non-contiguous). L2norm and chunk kernels
+        # need row-major K, so contiguous copy is required here.
+        # Use narrow+contiguous to copy only q/k/v (skip full mixed copy).
         actual_seq_len = mixed_qkv.shape[0]
-        query, key, value = torch.split(
-            mixed_qkv,
-            [layer.q_dim, layer.k_dim, layer.v_dim],
-            dim=-1,
-        )
-        query = query.reshape(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
-        key = key.reshape(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
-        value = value.reshape(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+        q_end = layer.q_dim
+        k_end = q_end + layer.k_dim
+        query = mixed_qkv[:, :q_end].contiguous().view(
+            1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
+        key = mixed_qkv[:, q_end:k_end].contiguous().view(
+            1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
+        value = mixed_qkv[:, k_end:].contiguous().view(
+            1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
         if is_target_verify:
             core_attn_out = self.kernel_dispatcher.target_verify(
