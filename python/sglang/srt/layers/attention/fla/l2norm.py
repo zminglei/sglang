@@ -132,7 +132,7 @@ def l2norm_fwd_packed_kernel(
     T: tl.constexpr,
     H: tl.constexpr,
     K: tl.constexpr,
-    S_ROW: tl.constexpr,  # stride between rows in input (= padded_T)
+    S_ROW,  # stride between rows in input (= padded_T), NOT constexpr to avoid recompilation
     BT: tl.constexpr,
     BD: tl.constexpr,     # >= K, power of 2
 ):
