@@ -107,9 +107,14 @@ def l2norm_fwd(
 ):
     x_shape_og = x.shape
 
-    # Detect 4D non-contiguous input from conv1d transpose+split+reshape
-    # Pattern: (1, T, H, K) with stride[-1] != 1 (column-major from transpose)
-    if (x.dim() == 4 and x.stride(-1) != 1 and x.stride(1) == 1):
+    # Detect 4D non-contiguous input from conv1d transpose+split+reshape.
+    # Pattern: (1, T, H, K) with stride[-1] != 1 (column-major from transpose).
+    # Only use the stride-aware 4D kernel for long sequences (T >= 2048)
+    # where the copy savings exceed the 2-pass kernel overhead.
+    # For short sequences, fall through to standard path which copies but
+    # uses a faster single-pass kernel.
+    if (x.dim() == 4 and x.stride(-1) != 1 and x.stride(1) == 1
+            and x.shape[1] >= 2048):
         # Use optimized 4D kernel that reads T-contiguous data
         B, T, H, K = x.shape
         assert B == 1, "4D l2norm only supports B=1"
