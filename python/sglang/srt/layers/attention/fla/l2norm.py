@@ -129,10 +129,10 @@ def l2norm_fwd(
 @triton.jit
 def l2norm_fwd_packed_kernel(
     x, y, eps,
-    T: tl.constexpr,
+    T,  # NOT constexpr: varies per chunked prefill batch
     H: tl.constexpr,
     K: tl.constexpr,
-    S_ROW,  # stride between rows in input (= padded_T), NOT constexpr to avoid recompilation
+    S_ROW,  # NOT constexpr: = padded_T, varies
     BT: tl.constexpr,
     BD: tl.constexpr,     # >= K, power of 2
 ):
@@ -205,10 +205,10 @@ def l2norm_fwd_packed(
 @triton.jit
 def extract_transpose_packed_kernel(
     x, y,
-    T: tl.constexpr,
+    T,  # NOT constexpr: varies per chunked prefill batch
     H: tl.constexpr,
     V: tl.constexpr,
-    S_ROW,
+    S_ROW,  # NOT constexpr: = padded_T, varies
     BT: tl.constexpr,
     BD: tl.constexpr,
 ):
