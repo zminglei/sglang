@@ -3,6 +3,10 @@ from typing import Tuple, Union
 import torch
 
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
+from sglang.srt.layers.attention.fla.l2norm import (
+    extract_transpose_packed,
+    l2norm_fwd_packed,
+)
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
@@ -373,8 +377,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             k_raw = conv_out[layer.q_dim:layer.q_dim + layer.k_dim]
             v_raw = conv_out[layer.q_dim + layer.k_dim:]
 
-            from sglang.srt.layers.attention.fla.l2norm import (
-                l2norm_fwd_packed, extract_transpose_packed)
             query = l2norm_fwd_packed(
                 q_raw, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
             key = l2norm_fwd_packed(
