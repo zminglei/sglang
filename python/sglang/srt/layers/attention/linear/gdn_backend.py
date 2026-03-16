@@ -403,14 +403,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-            # l2norm already applied to q/k in fused l2norm_fwd_packed above
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
                 v=value,
                 g=g,
                 beta=beta,
-                use_qk_l2norm_in_kernel=False,
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
