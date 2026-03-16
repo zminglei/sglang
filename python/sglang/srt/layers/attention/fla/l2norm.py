@@ -43,37 +43,75 @@ def l2norm_fwd_kernel1(
     tl.store(y + cols, b_y, mask=mask)
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BT": BT}, num_warps=num_warps)
-#         for num_warps in [1, 2, 4, 8, 16]
-#         for BT in BT_LIST
-#     ],
-#     key=["D", "NB"],
-# )
-@triton.jit
+@triton.jit(do_not_specialize=["T"])
 def l2norm_fwd_kernel(
     x,
     y,
     eps,
-    NB: tl.constexpr,
-    T: tl.constexpr,
+    T,
     D: tl.constexpr,
     BT: tl.constexpr,
     BD: tl.constexpr,
+    S_X_ROW,
+    S_X_HEAD,
+    S_Y_ROW,
+    S_Y_HEAD,
 ):
     i_t = tl.program_id(0)
-    p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
+    i_h = tl.program_id(1)
+    S_X_COL = S_X_HEAD // D
+    p_x = tl.make_block_ptr(
+        x + i_h * S_X_HEAD, (T, D), (S_X_ROW, S_X_COL),
+        (i_t * BT, 0), (BT, BD), (1, 0)
+    )
     b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
     b_var = tl.sum(b_x * b_x, axis=1)
     b_y = b_x / tl.sqrt(b_var + eps)[:, None]
-    p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
+    p_y = tl.make_block_ptr(
+        y + i_h * S_Y_HEAD, (T, D), (S_Y_ROW, 1),
+        (i_t * BT, 0), (BT, BD), (1, 0)
+    )
     tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
 
 
 def l2norm_fwd(
     x: torch.Tensor, eps: float = 1e-6, output_dtype: Optional[torch.dtype] = None
 ):
+    # Non-contiguous path: read strides from the tensor, write contiguous output.
+    # Handles channel-first as_strided views like (1, T, H, K) with non-standard strides.
+    if not x.is_contiguous() and x.ndim >= 3:
+        K = x.shape[-1]
+        H = x.shape[-2]
+        T = x.shape[-3]
+
+        dtype = output_dtype if output_dtype is not None else x.dtype
+        y = torch.empty(x.shape, dtype=dtype, device=x.device)
+
+        MAX_FUSED_SIZE = 65536 // x.element_size()
+        BD = min(MAX_FUSED_SIZE, triton.next_power_of_2(K))
+        if K > BD:
+            raise RuntimeError("This layer doesn't support feature dim >= 64KB.")
+
+        BT = 16
+        grid = (triton.cdiv(T, BT), H)
+        l2norm_fwd_kernel[grid](
+            x,
+            y,
+            eps,
+            T=T,
+            D=K,
+            BD=BD,
+            BT=BT,
+            S_X_ROW=x.stride(-3),
+            S_X_HEAD=x.stride(-2),
+            S_Y_ROW=y.stride(-3),
+            S_Y_HEAD=y.stride(-2),
+            num_warps=8,
+            num_stages=3,
+        )
+        return y
+
+    # Contiguous path (original)
     x_shape_og = x.shape
     x = x.view(-1, x.shape[-1])
     # allocate output
@@ -83,7 +121,6 @@ def l2norm_fwd(
         y = torch.empty_like(x, dtype=output_dtype)
     assert y.stride(-1) == 1
     T, D = x.shape[0], x.shape[-1]
-    # rstd = torch.empty((T,), dtype=torch.float32, device=x.device)
     # Less than 64KB per feature: enqueue fused kernel
     MAX_FUSED_SIZE = 65536 // x.element_size()
     BD = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
@@ -91,20 +128,19 @@ def l2norm_fwd(
         raise RuntimeError("This layer doesn't support feature dim >= 64KB.")
 
     if D <= 512:
-        NB = triton.cdiv(T, 2048)
-
-        def grid(meta):
-            return (triton.cdiv(T, meta["BT"]),)
-
-        l2norm_fwd_kernel[grid](
+        # Standard path: 1D grid over all rows, H_grid=1
+        l2norm_fwd_kernel[(triton.cdiv(T, 16), 1)](
             x,
             y,
             eps,
-            NB=NB,
             T=T,
             D=D,
             BD=BD,
             BT=16,
+            S_X_ROW=D,
+            S_X_HEAD=D,
+            S_Y_ROW=D,
+            S_Y_HEAD=D,
             num_warps=8,
             num_stages=3,
         )

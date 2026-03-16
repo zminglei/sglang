@@ -3,12 +3,13 @@
 
 import contextlib
 import functools
+import inspect
 import logging
 import os
 import sys
 from enum import Enum
 from functools import lru_cache
-from typing import Any, Callable, Dict, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 import torch
 import triton
@@ -131,41 +132,81 @@ def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]
     return wrapper
 
 
-def input_guard(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+def input_guard(
+    fn: Callable[..., torch.Tensor] = None,
+    *,
+    no_guard_contiguous: Optional[List[str]] = None,
+) -> Callable[..., torch.Tensor]:
     """
     A decorator to make sure all input tensors are contiguous and set the device based on input tensors.
+
+    Supports both ``@input_guard`` (no arguments) and
+    ``@input_guard(no_guard_contiguous=["q", "k", "v"])`` to skip
+    ``.contiguous()`` for the named parameters.
     """
 
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        contiguous_args = (
-            i if not isinstance(i, torch.Tensor) else i.contiguous() for i in args
-        )
-        contiguous_kwargs = {
-            k: (v if not isinstance(v, torch.Tensor) else v.contiguous())
-            for k, v in kwargs.items()
-        }
-
-        tensor = None
-        for arg in args:
-            if isinstance(arg, torch.Tensor):
-                tensor = arg
-                break
-        if tensor is None:
-            for value in kwargs.values():
-                if isinstance(value, torch.Tensor):
-                    tensor = value
-                    break
-
-        if tensor is not None:
-            ctx = custom_device_ctx(tensor.device.index)
+    def _wrap(fn, skip_names):
+        if skip_names:
+            param_names = list(inspect.signature(fn).parameters.keys())
+            skip = frozenset(skip_names)
         else:
-            ctx = contextlib.nullcontext()
+            param_names = None
+            skip = None
 
-        with ctx:
-            return fn(*contiguous_args, **contiguous_kwargs)
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if skip is not None:
+                new_args = []
+                for i, a in enumerate(args):
+                    name = param_names[i] if i < len(param_names) else None
+                    if isinstance(a, torch.Tensor) and name not in skip:
+                        new_args.append(a.contiguous())
+                    else:
+                        new_args.append(a)
+                new_kwargs = {
+                    k: (
+                        v
+                        if not isinstance(v, torch.Tensor) or k in skip
+                        else v.contiguous()
+                    )
+                    for k, v in kwargs.items()
+                }
+            else:
+                new_args = [
+                    i if not isinstance(i, torch.Tensor) else i.contiguous()
+                    for i in args
+                ]
+                new_kwargs = {
+                    k: (v if not isinstance(v, torch.Tensor) else v.contiguous())
+                    for k, v in kwargs.items()
+                }
 
-    return wrapper
+            tensor = None
+            for arg in args:
+                if isinstance(arg, torch.Tensor):
+                    tensor = arg
+                    break
+            if tensor is None:
+                for value in kwargs.values():
+                    if isinstance(value, torch.Tensor):
+                        tensor = value
+                        break
+
+            if tensor is not None:
+                ctx = custom_device_ctx(tensor.device.index)
+            else:
+                ctx = contextlib.nullcontext()
+
+            with ctx:
+                return fn(*new_args, **new_kwargs)
+
+        return wrapper
+
+    if fn is not None:
+        # Called as @input_guard (no parentheses)
+        return _wrap(fn, skip_names=None)
+    # Called as @input_guard(no_guard_contiguous=[...])
+    return lambda f: _wrap(f, skip_names=no_guard_contiguous)
 
 
 contiguous = input_guard

@@ -39,6 +39,8 @@ def recompute_w_u_fwd_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    S_V_T,
+    S_V_H,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -63,11 +65,12 @@ def recompute_w_u_fwd_kernel(
     b_A = tl.load(p_A, boundary_check=(0, 1))
     b_g = tl.exp(tl.load(p_g, boundary_check=(0,)))
 
+    S_V_D = S_V_H // V
     for i_v in range(tl.cdiv(V, BV)):
         p_v = tl.make_block_ptr(
-            v + (bos * H + i_h) * V,
+            v + bos * S_V_T + i_h * S_V_H,
             (T, V),
-            (H * V, 1),
+            (S_V_T, S_V_D),
             (i_t * BT, i_v * BV),
             (BT, BV),
             (1, 0),
@@ -120,13 +123,19 @@ def recompute_w_u_fwd(
     H = v.shape[-2]
     BT = A.shape[-1]
 
+    # Compute v strides from the actual tensor layout.
+    # For contiguous (B, T, H, V): S_V_T = H*V, S_V_H = V
+    # For channel-first via as_strided: S_V_T = 1, S_V_H = V*padded_T
+    S_V_T = v.stride(1)
+    S_V_H = v.stride(2)
+
     chunk_indices = (
         prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     )
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     BK = 64
     BV = 64
-    u = torch.empty_like(v)
+    u = v.new_empty(B, T, H, V)
     w = k.new_empty(B, T, H, K)
     recompute_w_u_fwd_kernel[(NT, B * H)](
         k=k,
@@ -147,6 +156,8 @@ def recompute_w_u_fwd(
         BK=BK,
         BV=BV,
         IS_VARLEN=cu_seqlens is not None,
+        S_V_T=S_V_T,
+        S_V_H=S_V_H,
         num_warps=4,
         num_stages=3,
     )
