@@ -3,10 +3,6 @@ from typing import Tuple, Union
 import torch
 
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
-from sglang.srt.layers.attention.fla.l2norm_packed import (
-    extract_transpose_packed,
-    l2norm_fwd_packed,
-)
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
@@ -352,7 +348,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 conv_states[conv_dst[mask_indices]] = mixed_qkv_to_track
 
             # Keep conv output in channel-first (total_dim, padded_T) format.
-            # Fused l2norm reads T-contiguous data, avoids transpose copy.
+            # The fused extend reads q/k/v directly via pointer arithmetic.
             conv_out = causal_conv1d_fn(
                 mixed_qkv,
                 layer.conv_weights,
@@ -364,18 +360,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 query_start_loc=query_start_loc,
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             )
-            actual_seq_len = seq_len
-            q_raw = conv_out[:layer.q_dim]
-            k_raw = conv_out[layer.q_dim:layer.q_dim + layer.k_dim]
-            v_raw = conv_out[layer.q_dim + layer.k_dim:]
-            query = l2norm_fwd_packed(
-                q_raw, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
-            key = l2norm_fwd_packed(
-                k_raw, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
-            value = extract_transpose_packed(
-                v_raw, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
         if is_target_verify:
+            # Target verify: use original split path
+            mixed_qkv_tv = conv_out.transpose(0, 1)[:seq_len]
+            query, key, value = torch.split(
+                mixed_qkv_tv, [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
+            actual_seq_len = query.shape[0]
+            query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
+            key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
+            value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
             core_attn_out = self.kernel_dispatcher.target_verify(
                 A_log=layer.A_log,
                 dt_bias=layer.dt_bias,
@@ -395,12 +389,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
-                q=query,
-                k=key,
-                v=value,
                 g=g,
                 beta=beta,
-                use_qk_l2norm_in_kernel=False,
+                conv_out=conv_out,
+                seq_len=seq_len,
+                q_dim=layer.q_dim,
+                k_dim=layer.k_dim,
+                v_dim=layer.v_dim,
+                num_q_heads=layer.num_q_heads,
+                num_k_heads=layer.num_k_heads,
+                num_v_heads=layer.num_v_heads,
+                head_q_dim=layer.head_q_dim,
+                head_k_dim=layer.head_k_dim,
+                head_v_dim=layer.head_v_dim,
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,

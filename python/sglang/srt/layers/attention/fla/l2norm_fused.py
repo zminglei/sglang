@@ -1,4 +1,4 @@
-# Fused l2norm and extract+transpose kernels for channel-first packed buffer
+# Fused l2norm and extract+transpose kernels for channel-first fused buffer
 # from causal_conv1d output. These read T-coalesced data (stride 1) and write
 # contiguous (T, H, K) output, eliminating the transpose copy overhead.
 
@@ -8,7 +8,7 @@ import triton.language as tl
 
 
 @triton.jit
-def l2norm_fwd_packed_kernel(
+def l2norm_fwd_fused_kernel(
     x, y, eps,
     T,  # NOT constexpr: varies per chunked prefill batch
     H: tl.constexpr,
@@ -45,11 +45,11 @@ def l2norm_fwd_packed_kernel(
     tl.store(y_base + offs_y, b_y.to(y.dtype.element_ty), mask=mask)
 
 
-def l2norm_fwd_packed(
+def l2norm_fwd_fused(
     x: torch.Tensor, seq_len: int, num_heads: int, head_dim: int,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Fused l2norm + transpose from channel-first packed buffer.
+    """Fused l2norm + transpose from channel-first fused buffer.
 
     Args:
         x: (H*K, padded_T) contiguous tensor from conv1d output dim-0 split.
@@ -70,7 +70,7 @@ def l2norm_fwd_packed(
     BT = 16
 
     grid = (triton.cdiv(T, BT), H)
-    l2norm_fwd_packed_kernel[grid](
+    l2norm_fwd_fused_kernel[grid](
         x, y, eps,
         T=T, H=H, K=K, S_ROW=S_ROW,
         BT=BT, BD=BD,
@@ -80,7 +80,7 @@ def l2norm_fwd_packed(
 
 
 @triton.jit
-def extract_transpose_packed_kernel(
+def extract_transpose_fused_kernel(
     x, y,
     T,  # NOT constexpr: varies per chunked prefill batch
     H: tl.constexpr,
@@ -108,10 +108,10 @@ def extract_transpose_packed_kernel(
     tl.store(y_base + offs_y, b_x.to(y.dtype.element_ty), mask=mask)
 
 
-def extract_transpose_packed(
+def extract_transpose_fused(
     x: torch.Tensor, seq_len: int, num_heads: int, head_dim: int,
 ) -> torch.Tensor:
-    """Extract and transpose from channel-first packed buffer.
+    """Extract and transpose from channel-first fused buffer.
 
     Args:
         x: (H*V, padded_T) contiguous tensor from conv1d output dim-0 split.
@@ -132,7 +132,7 @@ def extract_transpose_packed(
     BT = 16
 
     grid = (triton.cdiv(T, BT), H)
-    extract_transpose_packed_kernel[grid](
+    extract_transpose_fused_kernel[grid](
         x, y,
         T=T, H=H, V=V, S_ROW=S_ROW,
         BT=BT, BD=BD,
