@@ -25,6 +25,11 @@ from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func as flash_attn_varlen_func_fa3
 from sgl_kernel.flash_attn import flash_attn_with_kvcache as flash_attn_with_kvcache_fa3
 
+try:
+    from sgl_kernel.flash_attn import get_scheduler_metadata as get_scheduler_metadata_fa3
+except ImportError:
+    get_scheduler_metadata_fa3 = None
+
 flash_attn_varlen_func = flash_attn_varlen_func_fa3
 flash_attn_with_kvcache = flash_attn_with_kvcache_fa3
 
@@ -60,6 +65,8 @@ class FlashAttentionMetadata:
     page_table: torch.Tensor = None
     # Page table for Sliding Window Attention
     swa_page_table: torch.Tensor = None
+    # Precomputed FA3 scheduler metadata (avoids per-layer prepare_varlen_num_blocks)
+    scheduler_metadata: torch.Tensor = None
 
     # Encoder metadata
     # Cumulative sequence lengths for encoder key
@@ -368,6 +375,20 @@ class FlashAttentionBackend(AttentionBackend):
 
         self.fa_impl_ver = fa_impl_ver
 
+        # Store head info for precomputing FA3 scheduler metadata
+        self.head_dim = model_runner.model_config.head_dim
+        self.num_attention_heads = (
+            model_runner.model_config.hf_text_config.num_attention_heads
+            // model_runner.tp_size
+        )
+        self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
+            model_runner.tp_size
+        )
+        self.has_softcap = (
+            getattr(model_runner.model_config.hf_text_config, "attn_logit_softcapping", None) is not None
+            and getattr(model_runner.model_config.hf_text_config, "attn_logit_softcapping", 0.0) > 0.0
+        )
+
         # Local attention settings
         self.has_local_attention = model_runner.model_config.is_local_attention_model
         if self.has_local_attention:
@@ -489,6 +510,35 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
+                # Precompute FA3 scheduler metadata to avoid per-layer
+                # prepare_varlen_num_blocks kernel calls
+                if (
+                    get_scheduler_metadata_fa3 is not None
+                    and self.fa_impl_ver == 3
+                    and not self.use_mla
+                ):
+                    has_softcap = self.has_softcap
+                    window_left = -1
+                    window_right = -1
+                    if self.has_swa and self.sliding_window_size is not None:
+                        window_left = self.sliding_window_size
+                        window_right = 0
+                    metadata.scheduler_metadata = get_scheduler_metadata_fa3(
+                        batch_size=batch_size,
+                        max_seqlen_q=1,
+                        max_seqlen_k=metadata.max_seq_len_k,
+                        num_heads=self.num_attention_heads,
+                        num_heads_k=self.num_kv_heads,
+                        headdim=self.head_dim,
+                        cache_seqlens=metadata.cache_seqlens_int32,
+                        qkv_dtype=self.kv_cache_dtype,
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                        page_size=self.page_size,
+                        causal=True,
+                        window_size=(window_left, window_right),
+                        has_softcap=has_softcap,
+                        num_splits=self.num_splits,
+                    )
             # TODO: we need to test this part for llama 4 eagle case
             self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
@@ -1228,6 +1278,15 @@ class FlashAttentionBackend(AttentionBackend):
                 )
 
                 # Default: single-token self-attention
+                # Use precomputed scheduler_metadata when available and applicable.
+                # scheduler_metadata is only valid for non-SWA, non-cascade decode.
+                sched_meta = None
+                if (
+                    metadata.scheduler_metadata is not None
+                    and not is_swa_layer
+                    and not use_cascade_attn
+                ):
+                    sched_meta = metadata.scheduler_metadata
                 result = flash_attn_with_kvcache(
                     q=q_reshaped,
                     k_cache=key_cache,
@@ -1244,6 +1303,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
+                    scheduler_metadata=sched_meta,
                     **kwargs,
                 )
                 if use_cascade_attn:
@@ -1385,6 +1445,20 @@ class FlashAttentionBackend(AttentionBackend):
                 0, self.max_context_len, self.page_size, device=self.device
             ),
         }
+        # Pre-allocate scheduler_metadata buffer for CUDA graph
+        # Size: 1 (semaphore) + round_up(max_bs, 4) * 4 (causal decode vectors)
+        if (
+            get_scheduler_metadata_fa3 is not None
+            and self.fa_impl_ver == 3
+            and not self.use_mla
+        ):
+            b_rounded = ((max_bs + 3) // 4) * 4
+            self._sched_meta_buf = torch.zeros(
+                1 + b_rounded * 4, dtype=torch.int32, device=self.device
+            )
+        else:
+            self._sched_meta_buf = None
+
         # Only allocate local attention buffers if local attention is enabled
         # This prevents OOM errors when local attention is not being used
         if self.has_local_attention:
@@ -1754,6 +1828,28 @@ class FlashAttentionBackend(AttentionBackend):
 
                 self._maybe_update_local_attn_metadata_for_capture(metadata, batch_size)
 
+                # Compute scheduler_metadata into pre-allocated buffer for CUDA graph capture
+                if self._sched_meta_buf is not None:
+                    sched = get_scheduler_metadata_fa3(
+                        batch_size=batch_size,
+                        max_seqlen_q=1,
+                        max_seqlen_k=max(metadata.max_seq_len_k, 1),
+                        num_heads=self.num_attention_heads,
+                        num_heads_k=self.num_kv_heads,
+                        headdim=self.head_dim,
+                        cache_seqlens=metadata.cache_seqlens_int32,
+                        qkv_dtype=self.kv_cache_dtype,
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                        page_size=self.page_size,
+                        causal=True,
+                        has_softcap=self.has_softcap,
+                        num_splits=self.num_splits,
+                    )
+                    n = sched.shape[0]
+                    self._sched_meta_buf[:n] = sched
+                    self._sched_meta_buf[n:] = 0
+                    metadata.scheduler_metadata = self._sched_meta_buf[:n]
+
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
                 metadata.cache_seqlens_int32 = self.target_verify_metadata[
@@ -2020,6 +2116,28 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata,
                     bs,
                 )
+
+                # Recompute scheduler_metadata into pre-allocated buffer
+                if self._sched_meta_buf is not None and metadata.scheduler_metadata is not None:
+                    sched = get_scheduler_metadata_fa3(
+                        batch_size=bs,
+                        max_seqlen_q=1,
+                        max_seqlen_k=metadata.max_seq_len_k,
+                        num_heads=self.num_attention_heads,
+                        num_heads_k=self.num_kv_heads,
+                        headdim=self.head_dim,
+                        cache_seqlens=metadata.cache_seqlens_int32,
+                        qkv_dtype=self.kv_cache_dtype,
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                        page_size=self.page_size,
+                        causal=True,
+                        has_softcap=self.has_softcap,
+                        num_splits=self.num_splits,
+                    )
+                    n = sched.shape[0]
+                    self._sched_meta_buf[:n] = sched
+                    self._sched_meta_buf[n:] = 0
+
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
                 metadata = self.target_verify_metadata[bs]
