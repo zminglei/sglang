@@ -76,12 +76,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    int      headdim,"
       "    int      headdim_v,"
       "    ScalarType qkv_dtype,"
-      "    Tensor   seqused_k,"        // b
-      "    Tensor?  cu_seqlens_q,"     // b+1
-      "    Tensor?  cu_seqlens_k,"     // b+1
-      "    Tensor?  cu_seqlens_k_new," // b+1
-      "    Tensor?  seqused_q,"        // b
-      "    Tensor?  leftpad_k,"        // b
+      "    Tensor   seqused_k,"         // b
+      "    Tensor?  cu_seqlens_q,"      // b+1
+      "    Tensor?  cu_seqlens_k,"      // b+1
+      "    Tensor?  cu_seqlens_k_new,"  // b+1
+      "    Tensor?  seqused_q,"         // b
+      "    Tensor?  leftpad_k,"         // b
       "    int?     page_size,"
       "    int      max_seqlen_k_new = 0,"
       "    bool     is_causal = False,"

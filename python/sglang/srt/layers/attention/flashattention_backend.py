@@ -26,7 +26,9 @@ from sgl_kernel.flash_attn import flash_attn_varlen_func as flash_attn_varlen_fu
 from sgl_kernel.flash_attn import flash_attn_with_kvcache as flash_attn_with_kvcache_fa3
 
 try:
-    from sgl_kernel.flash_attn import get_scheduler_metadata as get_scheduler_metadata_fa3
+    from sgl_kernel.flash_attn import (
+        get_scheduler_metadata as get_scheduler_metadata_fa3,
+    )
 except ImportError:
     get_scheduler_metadata_fa3 = None
 
@@ -385,8 +387,14 @@ class FlashAttentionBackend(AttentionBackend):
             model_runner.tp_size
         )
         self.has_softcap = (
-            getattr(model_runner.model_config.hf_text_config, "attn_logit_softcapping", None) is not None
-            and getattr(model_runner.model_config.hf_text_config, "attn_logit_softcapping", 0.0) > 0.0
+            getattr(
+                model_runner.model_config.hf_text_config, "attn_logit_softcapping", None
+            )
+            is not None
+            and getattr(
+                model_runner.model_config.hf_text_config, "attn_logit_softcapping", 0.0
+            )
+            > 0.0
         )
 
         # Local attention settings
@@ -2118,7 +2126,10 @@ class FlashAttentionBackend(AttentionBackend):
                 )
 
                 # Recompute scheduler_metadata into pre-allocated buffer
-                if self._sched_meta_buf is not None and metadata.scheduler_metadata is not None:
+                if (
+                    self._sched_meta_buf is not None
+                    and metadata.scheduler_metadata is not None
+                ):
                     sched = get_scheduler_metadata_fa3(
                         batch_size=bs,
                         max_seqlen_q=1,
