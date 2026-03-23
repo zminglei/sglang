@@ -433,11 +433,8 @@ class FlashAttentionBackend(AttentionBackend):
         """
         if get_scheduler_metadata_fa3 is None or self.fa_impl_ver != 3 or self.use_mla:
             return None
-        window_left = -1
-        window_right = -1
-        if self.has_swa and self.sliding_window_size is not None:
-            window_left = self.sliding_window_size
-            window_right = 0
+        # Always use window_size=(-1, -1) because scheduler_metadata is only
+        # consumed by non-SWA layers (SWA layers skip it in forward_decode).
         return get_scheduler_metadata_fa3(
             batch_size=batch_size,
             max_seqlen_q=1,
@@ -450,7 +447,6 @@ class FlashAttentionBackend(AttentionBackend):
             cu_seqlens_q=cu_seqlens_q,
             page_size=self.page_size,
             causal=True,
-            window_size=(window_left, window_right),
             has_softcap=self.has_softcap,
             num_splits=self.num_splits,
         )
