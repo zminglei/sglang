@@ -59,6 +59,30 @@ if is_npu():
 
 logger = logging.getLogger(__name__)
 
+if _is_cuda:
+    import triton
+    from flashinfer.triton.kernels.activation import silu_and_mul_kernel as _flashinfer_silu_and_mul_kernel
+
+    # Below this batch size, use the triton 2D-grid kernel for better SM occupancy.
+    _SILU_TRITON_BS_THRESHOLD = 128
+
+    def _silu_and_mul_flashinfer(x: torch.Tensor, out: torch.Tensor, d: int) -> None:
+        x_2d = x.reshape(-1, x.shape[-1])
+        out_2d = out.reshape(-1, d)
+        grid = (x_2d.shape[0], triton.cdiv(d, 1024))
+        _flashinfer_silu_and_mul_kernel[grid](
+            o_ptr=out_2d,
+            o_stride=out_2d.stride(0),
+            o_scale_ptr=None,
+            x_ptr=x_2d,
+            x_stride=x_2d.stride(0),
+            x_scale_ptr=None,
+            d=d,
+            BLOCK_SIZE=1024,
+            HAS_X_SCALE=False,
+            HAS_O_SCALE=False,
+        )
+
 
 class SiluAndMul(MultiPlatformOp):
     def __init__(self, *args, **kwargs):
@@ -74,7 +98,11 @@ class SiluAndMul(MultiPlatformOp):
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        silu_and_mul(x, out)
+        num_tokens = x.shape[0] if x.ndim == 2 else x.numel() // x.shape[-1]
+        if num_tokens < _SILU_TRITON_BS_THRESHOLD:
+            _silu_and_mul_flashinfer(x, out, d)
+        else:
+            silu_and_mul(x, out)
         return out
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
