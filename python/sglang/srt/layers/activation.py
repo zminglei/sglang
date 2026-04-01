@@ -61,7 +61,9 @@ logger = logging.getLogger(__name__)
 
 if _is_cuda:
     import triton
-    from flashinfer.triton.kernels.activation import silu_and_mul_kernel as _flashinfer_silu_and_mul_kernel
+    from flashinfer.triton.kernels.activation import (
+        silu_and_mul_kernel as _flashinfer_silu_and_mul_kernel,
+    )
 
     # Below this batch size, use the triton 2D-grid kernel for better SM occupancy.
     _SILU_TRITON_BS_THRESHOLD = 128
