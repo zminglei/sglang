@@ -405,7 +405,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
                 conv_states[conv_dst[mask_indices]] = mixed_qkv_to_track
 
-            mixed_qkv = causal_conv1d_fn(
+            # Keep conv output in channel-first (total_dim, padded_T) format.
+            # The fused extend reads q/k/v directly via pointer arithmetic.
+            conv_out = causal_conv1d_fn(
                 mixed_qkv,
                 layer.conv_weights,
                 layer.bias,
@@ -415,20 +417,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            ).transpose(0, 1)[:seq_len]
-
-        query, key, value = torch.split(
-            mixed_qkv,
-            [layer.q_dim, layer.k_dim, layer.v_dim],
-            dim=-1,
-        )
-
-        actual_seq_len = query.shape[0]
-        query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
-        key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
-        value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+            )
 
         if is_target_verify:
+            # Target verify: use original split path
+            mixed_qkv_tv = conv_out.transpose(0, 1)[:seq_len]
+            query, key, value = torch.split(
+                mixed_qkv_tv, [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
+            actual_seq_len = query.shape[0]
+            query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
+            key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
+            value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
             core_attn_out = self.kernel_dispatcher.target_verify(
                 A_log=layer.A_log,
                 dt_bias=layer.dt_bias,
@@ -448,11 +447,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
-                q=query,
-                k=key,
-                v=value,
                 g=g,
                 beta=beta,
+                conv_out=conv_out,
+                seq_len=seq_len,
+                q_dim=layer.q_dim,
+                k_dim=layer.k_dim,
+                v_dim=layer.v_dim,
+                num_q_heads=layer.num_q_heads,
+                num_k_heads=layer.num_k_heads,
+                num_v_heads=layer.num_v_heads,
+                head_q_dim=layer.head_q_dim,
+                head_k_dim=layer.head_k_dim,
+                head_v_dim=layer.head_v_dim,
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,

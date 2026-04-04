@@ -124,9 +124,6 @@ class TritonGDNKernel(LinearAttnKernelBase):
 
     def extend(
         self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
         g: torch.Tensor,
         beta: torch.Tensor,
         *,
@@ -136,9 +133,42 @@ class TritonGDNKernel(LinearAttnKernelBase):
         **kwargs,
     ) -> tuple:
         recurrent_state = ssm_states
-        recurrent_state_indices_args = {"initial_state_indices": cache_indices}
+        recurrent_state_indices = cache_indices
         if is_npu() or is_cpu():
             recurrent_state = ssm_states[cache_indices]
+            recurrent_state_indices = None
+
+        # Fused path: read q/k/v from conv_out channel-first buffer
+        conv_out = kwargs.get("conv_out")
+        if conv_out is not None:
+            from sglang.srt.layers.attention.fla.chunk_fused import (
+                chunk_gated_delta_rule_fwd_fused,
+            )
+            o, h = chunk_gated_delta_rule_fwd_fused(
+                conv_out=conv_out,
+                seq_len=kwargs["seq_len"],
+                q_dim=kwargs["q_dim"],
+                k_dim=kwargs["k_dim"],
+                v_dim=kwargs["v_dim"],
+                num_q_heads=kwargs["num_q_heads"],
+                num_k_heads=kwargs["num_k_heads"],
+                num_v_heads=kwargs["num_v_heads"],
+                head_q_dim=kwargs["head_q_dim"],
+                head_k_dim=kwargs["head_k_dim"],
+                head_v_dim=kwargs["head_v_dim"],
+                g=g,
+                beta=beta,
+                scale=None,
+                initial_state=recurrent_state,
+                initial_state_indices=recurrent_state_indices if recurrent_state_indices is not None else cache_indices,
+                cu_seqlens=query_start_loc,
+            )
+            return o.to(g.dtype), recurrent_state, h
+
+        # Fallback: separate q/k/v (target_verify, non-CUDA, etc.)
+        q, k, v = kwargs["q"], kwargs["k"], kwargs["v"]
+        recurrent_state_indices_args = {"initial_state_indices": cache_indices}
+        if is_npu() or is_cpu():
             recurrent_state_indices_args = {}
         return chunk_gated_delta_rule(
             q=q,
