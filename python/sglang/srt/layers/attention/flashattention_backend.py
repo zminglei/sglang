@@ -1140,6 +1140,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
+                    ver=self.fa_impl_ver,
                     scheduler_metadata=sched_meta,
                     **kwargs,
                 )
