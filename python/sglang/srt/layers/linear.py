@@ -1632,3 +1632,87 @@ class ColumnParallelBatchedLinear(nn.Module):
         start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
         param.data[loaded_shard_id].copy_(loaded_weight)
+
+
+# --- TinyGEMM Router Linear ---
+# FlashInfer tinygemm BF16 fast path for MoE router on SM90+.
+# Provides ~3% decode TPOT improvement for MoE models.
+
+_is_tinygemm_supported = False
+_tinygemm_bf16_fn = None
+
+try:
+    from sglang.srt.utils import (
+        is_blackwell_supported,
+        is_cuda,
+        is_flashinfer_available,
+        is_sm90_supported,
+    )
+
+    if (
+        is_cuda()
+        and is_flashinfer_available()
+        and (is_sm90_supported() or is_blackwell_supported())
+    ):
+        from flashinfer.gemm import tinygemm_bf16 as _tinygemm_bf16_fn
+
+        _is_tinygemm_supported = True
+except Exception:
+    pass
+
+
+class TinyGemmLinear(ReplicatedLinear):
+    """ReplicatedLinear with a FlashInfer tinygemm BF16 fast path for MoE routers.
+
+    On SM90+ (H100/H200/B200), uses tinygemm for small batch sizes (<=128)
+    during decode, providing ~3% decode TPOT improvement for MoE models.
+    Falls back to standard ReplicatedLinear for larger batches, unsupported
+    hardware, or when running under torch.compile (piecewise CUDA graph).
+
+    Usage:
+        Replace ``ReplicatedLinear`` with ``TinyGemmLinear`` for the MoE router gate::
+
+            self.gate = TinyGemmLinear(
+                config.hidden_size, config.num_experts,
+                bias=False, quant_config=None,
+                prefix=add_prefix("gate", prefix),
+            )
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._use_tinygemm = (
+            _is_tinygemm_supported
+            and not self.skip_bias_add
+            and self.weight.is_contiguous()
+            and self.weight.shape[0] % 16 == 0
+            and self.weight.shape[1] % 64 == 0
+            and self.weight.dtype == torch.bfloat16
+            and (
+                self.bias is None
+                or (
+                    self.bias.dtype == torch.bfloat16
+                    and self.bias.is_contiguous()
+                    and self.bias.shape[0] == self.weight.shape[0]
+                )
+            )
+        )
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if (
+            self._use_tinygemm
+            and not torch.compiler.is_compiling()
+            and x.ndim == 2
+            and x.is_cuda
+            and x.shape[0] <= 128
+            and x.is_contiguous()
+            and x.shape[1] == self.weight.shape[1]
+            and x.dtype == torch.bfloat16
+        ):
+            out = x.new_empty((x.shape[0], self.output_size))
+            _tinygemm_bf16_fn(x, self.weight, out, self.bias)
+            return out, None
+
+        return super().forward(x)
