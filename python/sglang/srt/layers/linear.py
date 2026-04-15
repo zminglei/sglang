@@ -1656,12 +1656,6 @@ try:
     ):
         from flashinfer.gemm import tinygemm_bf16 as _tinygemm_bf16_fn
 
-        # Mark tinygemm as opaque for torch.compile so dynamo does not trace
-        # into flashinfer's JIT build path (which calls pathlib.stat and
-        # triggers "posix.stat marked as skipped" errors during recompilation).
-        # The compiled graph will include the tinygemm call as a leaf node.
-        torch.compiler.allow_in_graph(_tinygemm_bf16_fn)
-
         _is_tinygemm_supported = True
 except Exception:
     pass
@@ -1672,8 +1666,8 @@ class TinyGemmLinear(ReplicatedLinear):
 
     On SM90+ (H100/H200/B200), uses tinygemm for small batch sizes (<=128)
     during decode, providing ~3% decode TPOT improvement for MoE models.
-    Falls back to standard ReplicatedLinear for larger batches or when
-    tinygemm is unavailable.
+    Falls back to standard ReplicatedLinear for larger batches, unsupported
+    hardware, or when running under torch.compile (piecewise CUDA graph).
 
     Usage:
         Replace ``ReplicatedLinear`` with ``TinyGemmLinear`` for the MoE router gate::
@@ -1709,6 +1703,7 @@ class TinyGemmLinear(ReplicatedLinear):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if (
             self._use_tinygemm
+            and not torch.compiler.is_compiling()
             and x.ndim == 2
             and x.is_cuda
             and x.shape[0] <= 128
