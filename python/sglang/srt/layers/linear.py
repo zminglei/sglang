@@ -1639,7 +1639,7 @@ class ColumnParallelBatchedLinear(nn.Module):
 # Provides ~3% decode TPOT improvement for MoE models.
 
 _is_tinygemm_supported = False
-_tinygemm_bf16_fn = None
+_tinygemm_bf16_op = None
 
 try:
     from sglang.srt.utils import (
@@ -1654,8 +1654,34 @@ try:
         and is_flashinfer_available()
         and (is_sm90_supported() or is_blackwell_supported())
     ):
-        from flashinfer.gemm import tinygemm_bf16 as _tinygemm_bf16_fn
+        from flashinfer.gemm import tinygemm_bf16 as _raw_tinygemm_bf16
 
+        # Wrap flashinfer tinygemm as a torch custom op with a fake tensor
+        # implementation. This makes it compatible with torch.compile /
+        # piecewise CUDA graph: dynamo can trace through it using FakeTensors
+        # for shape inference, and the real kernel runs at execution time.
+        @torch.library.custom_op(
+            "sglang::tinygemm_bf16", mutates_args=["out"]
+        )
+        def _tinygemm_bf16_impl(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            out: torch.Tensor,
+            bias: Optional[torch.Tensor] = None,
+        ) -> None:
+            _raw_tinygemm_bf16(input, weight, out, bias)
+
+        @_tinygemm_bf16_impl.register_fake
+        def _tinygemm_bf16_fake(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            out: torch.Tensor,
+            bias: Optional[torch.Tensor] = None,
+        ) -> None:
+            # out is mutated in-place; nothing to return.
+            pass
+
+        _tinygemm_bf16_op = _tinygemm_bf16_impl
         _is_tinygemm_supported = True
 except Exception:
     pass
@@ -1666,8 +1692,8 @@ class TinyGemmLinear(ReplicatedLinear):
 
     On SM90+ (H100/H200/B200), uses tinygemm for small batch sizes (<=128)
     during decode, providing ~3% decode TPOT improvement for MoE models.
-    Falls back to standard ReplicatedLinear for larger batches, unsupported
-    hardware, or when running under torch.compile (piecewise CUDA graph).
+    Falls back to standard ReplicatedLinear for larger batches or when
+    tinygemm is unavailable.
 
     Usage:
         Replace ``ReplicatedLinear`` with ``TinyGemmLinear`` for the MoE router gate::
@@ -1703,7 +1729,6 @@ class TinyGemmLinear(ReplicatedLinear):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if (
             self._use_tinygemm
-            and not torch.compiler.is_compiling()
             and x.ndim == 2
             and x.is_cuda
             and x.shape[0] <= 128
@@ -1712,7 +1737,7 @@ class TinyGemmLinear(ReplicatedLinear):
             and x.dtype == torch.bfloat16
         ):
             out = x.new_empty((x.shape[0], self.output_size))
-            _tinygemm_bf16_fn(x, self.weight, out, self.bias)
+            _tinygemm_bf16_op(x, self.weight, out, self.bias)
             return out, None
 
         return super().forward(x)
