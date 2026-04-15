@@ -53,6 +53,7 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    TinyGemmLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
@@ -191,7 +192,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             routing_method_type=RoutingMethodType.RenormalizeNaive,
         )
 
-        self.gate = ReplicatedLinear(
+        self.gate = TinyGemmLinear(
             config.hidden_size,
             config.num_experts,
             bias=False,
