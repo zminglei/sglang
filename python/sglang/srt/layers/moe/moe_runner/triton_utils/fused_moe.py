@@ -34,6 +34,7 @@ from .fused_moe_triton_kernels import (
 )
 from .moe_align_block_size import moe_align_block_size
 
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import StandardTopKOutput
 
@@ -229,9 +230,14 @@ def fused_experts(
     block_shape: Optional[List[int]] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
+    # filter_expert=True makes the kernel skip blocks routed to expert_id == -1
+    # (the sentinel slot from sgl_moe_align_block_size). Required whenever
+    # topk_ids may contain -1 entries: EP filtering produces them when EP > 1,
+    # and the CUDA-graph pad-token mask produces them when that mask is active.
     filter_expert = (
         moe_runner_config.num_experts is None
         or moe_runner_config.num_experts != moe_runner_config.num_local_experts
+        or moe_runner_config.enable_pad_token_mask
     )
     if moe_runner_config.inplace:
         assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"

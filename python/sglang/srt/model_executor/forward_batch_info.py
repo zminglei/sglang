@@ -1079,7 +1079,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
 
 def enable_num_token_non_padded(server_args):
-    return get_moe_expert_parallel_world_size() > 1
+    return (
+        get_moe_expert_parallel_world_size() > 1
+        or getattr(server_args, "enable_pad_token_mask", False)
+    )
 
 
 class PPProxyTensors:

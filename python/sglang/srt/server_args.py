@@ -537,6 +537,7 @@ class ServerArgs:
     moe_a2a_backend: Literal[
         "none", "deepep", "mooncake", "nixl", "mori", "ascend_fuseep", "flashinfer"
     ] = "none"
+    enable_pad_token_mask: bool = False
     moe_runner_backend: str = "auto"
     record_nolora_graph: bool = True
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
@@ -2986,6 +2987,13 @@ class ServerArgs:
             )
 
     def _handle_a2a_moe(self):
+        if self.enable_pad_token_mask and not self.disable_piecewise_cuda_graph:
+            self.disable_piecewise_cuda_graph = True
+            logger.warning(
+                "--enable-pad-token-mask disables piecewise CUDA graph: the "
+                "mask introduces dynamic -1 entries in topk_ids that the PCG "
+                "backend cannot replay safely."
+            )
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
@@ -5513,6 +5521,15 @@ class ServerArgs:
             "--enable-eplb",
             action="store_true",
             help="Enable EPLB algorithm",
+        )
+        parser.add_argument(
+            "--enable-pad-token-mask",
+            action="store_true",
+            help="Mask CUDA-graph padded tokens out of MoE expert routing "
+                 "(by setting their topk_ids to -1). Reduces extra expert "
+                 "weight loading at low real batch sizes. Active for the "
+                 "default fused_moe path; the EP/DeepEP path already gets this "
+                 "via EP-world-size>1.",
         )
         parser.add_argument(
             "--eplb-algorithm",

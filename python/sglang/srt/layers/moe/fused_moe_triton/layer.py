@@ -246,6 +246,10 @@ class FusedMoE(torch.nn.Module):
             hidden_size = round_up(hidden_size, 256)
         self.hidden_size = hidden_size
 
+        from sglang.srt.model_executor.forward_batch_info import (
+            enable_num_token_non_padded,
+        )
+
         self.moe_runner_config = MoeRunnerConfig(
             num_experts=num_experts,
             num_local_experts=self.num_local_experts,
@@ -264,6 +268,9 @@ class FusedMoE(torch.nn.Module):
             gemm1_clamp_limit=gemm1_clamp_limit,
             is_gated=is_gated,
             routing_method_type=routing_method_type,
+            enable_pad_token_mask=enable_num_token_non_padded(
+                get_global_server_args()
+            ),
         )
 
         self.quant_method: Optional[FusedMoEMethodBase] = None
