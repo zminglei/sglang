@@ -79,6 +79,10 @@ class PrefillInputBuffers(ForwardInputBuffers):
     positions: torch.Tensor
     input_embeds: Optional[torch.Tensor]
     mrope_positions: Optional[torch.Tensor]
+    # Stable buffer for ForwardBatch.num_token_non_padded so the captured PCG
+    # cudagraph always sees the same tensor identity across replays. The value
+    # is refreshed each step in replay_prepare.
+    num_token_non_padded: torch.Tensor
 
 
 @contextmanager
@@ -237,6 +241,7 @@ class PiecewiseCudaGraphRunner:
                 else None
             )
             positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
+            num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
 
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
@@ -267,6 +272,7 @@ class PiecewiseCudaGraphRunner:
             positions=positions,
             input_embeds=input_embeds,
             mrope_positions=mrope_positions,
+            num_token_non_padded=num_token_non_padded,
         )
         self.buffers.share_buffers()
 
@@ -389,7 +395,7 @@ class PiecewiseCudaGraphRunner:
                 spec_algorithm=None,
                 spec_info=None,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
-                num_token_non_padded=None,
+                num_token_non_padded=buffers.num_token_non_padded,
                 num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
@@ -561,7 +567,7 @@ class PiecewiseCudaGraphRunner:
                 spec_algorithm=None,
                 spec_info=None,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
-                num_token_non_padded=None,
+                num_token_non_padded=buffers.num_token_non_padded,
                 num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
@@ -638,6 +644,14 @@ class PiecewiseCudaGraphRunner:
         buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
         buffers.positions[:num_tokens].copy_(forward_batch.positions)
         buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
+        # Refresh stable num_token_non_padded buffer with this step's value
+        # so the captured PCG cudagraph sees up-to-date pad-token info.
+        if forward_batch.num_token_non_padded is not None:
+            buffers.num_token_non_padded.copy_(
+                forward_batch.num_token_non_padded.view(1)
+            )
+        else:
+            buffers.num_token_non_padded.fill_(num_tokens)
         if buffers.out_cache_loc_swa is not None:
             buffers.out_cache_loc_swa[: self.raw_num_tokens].copy_(
                 self.model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
@@ -752,7 +766,7 @@ class PiecewiseCudaGraphRunner:
             spec_algorithm=forward_batch.spec_algorithm,
             spec_info=forward_batch.spec_info,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
-            num_token_non_padded=forward_batch.num_token_non_padded,
+            num_token_non_padded=buffers.num_token_non_padded,
             num_token_non_padded_cpu=forward_batch.num_token_non_padded_cpu,
             global_forward_mode=pcg_global_forward_mode,
             lora_ids=forward_batch.lora_ids,

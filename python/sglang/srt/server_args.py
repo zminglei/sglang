@@ -2987,13 +2987,6 @@ class ServerArgs:
             )
 
     def _handle_a2a_moe(self):
-        if self.enable_pad_token_mask and not self.disable_piecewise_cuda_graph:
-            self.disable_piecewise_cuda_graph = True
-            logger.warning(
-                "--enable-pad-token-mask disables piecewise CUDA graph: the "
-                "mask introduces dynamic -1 entries in topk_ids that the PCG "
-                "backend cannot replay safely."
-            )
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
