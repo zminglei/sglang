@@ -230,10 +230,7 @@ def fused_experts(
     block_shape: Optional[List[int]] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
-    # filter_expert=True makes the kernel skip blocks routed to expert_id == -1
-    # (the sentinel slot from sgl_moe_align_block_size). Required whenever
-    # topk_ids may contain -1 entries: EP filtering produces them when EP > 1,
-    # and the CUDA-graph pad-token mask produces them when that mask is active.
+    # Kernel skips sentinel (-1) blocks; needed for EP filtering and pad mask.
     filter_expert = (
         moe_runner_config.num_experts is None
         or moe_runner_config.num_experts != moe_runner_config.num_local_experts

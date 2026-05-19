@@ -108,9 +108,7 @@ class MixtralMoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
-        # Cached once at construction time so the hot forward path is
-        # PCG/Inductor-friendly (no Python function calls or server_args
-        # lookups inside the captured region).
+        # Cache to keep forward hot path PCG/Inductor-friendly.
         self._enable_pad_token_mask: bool = bool(
             enable_num_token_non_padded(get_global_server_args())
         )
@@ -125,7 +123,7 @@ class MixtralMoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        # Only forward num_token_non_padded when the optimization is enabled.
+        # Forward num_token_non_padded only when the optimization is enabled.
         num_token_non_padded = None
         if forward_batch is not None and self._enable_pad_token_mask:
             num_token_non_padded = forward_batch.num_token_non_padded

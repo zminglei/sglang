@@ -293,9 +293,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             )
             self.top_k = config.num_experts_per_tok
 
-        # Cached once at construction time so the hot forward path is
-        # PCG/Inductor-friendly (no Python function calls or server_args
-        # lookups inside the captured region).
+        # Cache to keep forward hot path PCG/Inductor-friendly.
         self._enable_pad_token_mask: bool = bool(
             enable_num_token_non_padded(get_global_server_args())
         )
@@ -340,10 +338,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        # Only forward num_token_non_padded when the optimization is enabled.
-        # Reading it unconditionally would activate the topk mask kernel even
-        # when the value is meaningless (e.g. the CUDA-graph buffer in TP-only
-        # mode with no real value populated).
+        # Forward num_token_non_padded only when the optimization is enabled;
+        # otherwise the topk mask kernel would run on a stale CUDA-graph buffer.
         num_token_non_padded = None
         if forward_batch is not None and self._enable_pad_token_mask:
             num_token_non_padded = forward_batch.num_token_non_padded
