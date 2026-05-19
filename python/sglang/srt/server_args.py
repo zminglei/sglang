@@ -537,7 +537,6 @@ class ServerArgs:
     moe_a2a_backend: Literal[
         "none", "deepep", "mooncake", "nixl", "mori", "ascend_fuseep", "flashinfer"
     ] = "none"
-    enable_pad_token_mask: bool = False
     moe_runner_backend: str = "auto"
     record_nolora_graph: bool = True
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
@@ -5514,15 +5513,6 @@ class ServerArgs:
             "--enable-eplb",
             action="store_true",
             help="Enable EPLB algorithm",
-        )
-        parser.add_argument(
-            "--enable-pad-token-mask",
-            action="store_true",
-            help="Mask CUDA-graph padded tokens out of MoE expert routing "
-                 "(by setting their topk_ids to -1). Reduces extra expert "
-                 "weight loading at low real batch sizes. Active for the "
-                 "default fused_moe path; the EP/DeepEP path already gets this "
-                 "via EP-world-size>1.",
         )
         parser.add_argument(
             "--eplb-algorithm",

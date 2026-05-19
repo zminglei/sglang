@@ -49,8 +49,8 @@ class MoeRunnerConfig:
     gemm1_alpha: Optional[float] = None
     gemm1_clamp_limit: Optional[float] = None
 
-    # Set by FusedMoE.__init__ from --enable-pad-token-mask; consumed by
-    # fused_moe.py to force filter_expert=True so the kernel skips sentinels.
+    # Forces filter_expert=True in the triton fused_moe kernel so it skips
+    # rows whose topk_ids were rewritten to -1 by the CUDA-graph pad mask.
     enable_pad_token_mask: bool = False
 
 

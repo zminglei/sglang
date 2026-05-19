@@ -1079,10 +1079,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
 
 def enable_num_token_non_padded(server_args):
-    return (
-        get_moe_expert_parallel_world_size() > 1
-        or getattr(server_args, "enable_pad_token_mask", False)
-    )
+    # Always populate ForwardBatch.num_token_non_padded so the MoE pad-token
+    # mask can drop padded rows out of expert routing. The EP/DeepEP path has
+    # always relied on this; the default fused_moe_triton path now does too.
+    return True
 
 
 class PPProxyTensors:
