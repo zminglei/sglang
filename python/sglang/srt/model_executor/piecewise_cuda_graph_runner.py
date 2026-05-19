@@ -79,9 +79,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
     positions: torch.Tensor
     input_embeds: Optional[torch.Tensor]
     mrope_positions: Optional[torch.Tensor]
-    # Stable buffer for ForwardBatch.num_token_non_padded so the captured PCG
-    # cudagraph always sees the same tensor identity across replays. The value
-    # is refreshed each step in replay_prepare.
+    # Stable buffer for ForwardBatch.num_token_non_padded; refreshed in replay_prepare.
     num_token_non_padded: torch.Tensor
 
 
@@ -644,8 +642,6 @@ class PiecewiseCudaGraphRunner:
         buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
         buffers.positions[:num_tokens].copy_(forward_batch.positions)
         buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
-        # Refresh stable num_token_non_padded buffer with this step's value
-        # so the captured PCG cudagraph sees up-to-date pad-token info.
         if forward_batch.num_token_non_padded is not None:
             buffers.num_token_non_padded.copy_(
                 forward_batch.num_token_non_padded.view(1)
