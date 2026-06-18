@@ -218,6 +218,7 @@ class FusedMoE(torch.nn.Module):
         self.use_presharded_weights = use_presharded_weights
 
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
+
         self.use_flashinfer_trtllm_moe = (
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -245,6 +246,10 @@ class FusedMoE(torch.nn.Module):
             hidden_size = round_up(hidden_size, 256)
         self.hidden_size = hidden_size
 
+        from sglang.srt.model_executor.forward_batch_info import (
+            enable_num_token_non_padded,
+        )
+
         self.moe_runner_config = MoeRunnerConfig(
             num_experts=num_experts,
             num_local_experts=self.num_local_experts,
@@ -264,6 +269,9 @@ class FusedMoE(torch.nn.Module):
             swiglu_limit=swiglu_limit,
             is_gated=is_gated,
             routing_method_type=routing_method_type,
+            # Quantized kernels can't skip -1 sentinels; only enable for unquantized.
+            enable_pad_token_mask=enable_num_token_non_padded()
+            and quant_config is None,
         )
 
         self.quant_method: Optional[FusedMoEMethodBase] = None
@@ -465,6 +473,8 @@ class FusedMoE(torch.nn.Module):
             start = 0
 
         if self.use_padded_loading:
+            if _is_cpu and is_bias:
+                shard_dim = 1
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -534,6 +544,8 @@ class FusedMoE(torch.nn.Module):
             shard_size = expert_data.shape[shard_dim]
 
         if self.use_padded_loading:
+            if _is_cpu and is_bias:
+                shard_dim = 1
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
