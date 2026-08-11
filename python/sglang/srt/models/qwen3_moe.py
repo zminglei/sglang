@@ -69,7 +69,10 @@ from sglang.srt.layers.utils.cp_utils import (
     prepare_context_parallel_metadata,
 )
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    PPProxyTensors,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen2_moe import Qwen2MoeModel
@@ -289,6 +292,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             )
             self.top_k = config.num_experts_per_tok
 
+        self._enable_pad_token_mask: bool = bool(
+            self.experts.moe_runner_config.enable_pad_token_mask
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -302,7 +309,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             and not get_moe_a2a_backend().is_ascend_fuseep()
         ):
             return self.forward_normal(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
+                hidden_states,
+                forward_batch,
+                should_allreduce_fusion,
+                use_reduce_scatter,
             )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
@@ -320,6 +330,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
@@ -328,7 +339,14 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        num_token_non_padded = None
+        if forward_batch is not None and self._enable_pad_token_mask:
+            num_token_non_padded = forward_batch.num_token_non_padded
+        topk_output = self.topk(
+            hidden_states,
+            router_logits,
+            num_token_non_padded=num_token_non_padded,
+        )
         final_hidden_states = self.experts(hidden_states, topk_output)
 
         if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
@@ -891,10 +909,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
             )
         )
 
-    def op_mlp(self, state):
-        hidden_states = state.pop("hidden_states_mlp_input")
-        state.hidden_states_mlp_output = self.mlp(hidden_states, state.forward_batch)
-
     def op_comm_postprocess_layer(self, state):
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             state.pop("hidden_states_mlp_output"),
@@ -1005,6 +1019,7 @@ class Qwen3MoeForCausalLM(nn.Module):
                     self.attn_cp_rank,
                     self.attn_cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
+                    extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
 
         hidden_states = self.model(
@@ -1110,7 +1125,9 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.capture_aux_hidden_states = True
         self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
+    ):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1131,6 +1148,21 @@ class Qwen3MoeForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
+            if is_mtp:
+                if "mtp" not in name:
+                    continue
+
+                if name in [
+                    "mtp.fc.weight",
+                    "mtp.pre_fc_norm_embedding.weight",
+                    "mtp.pre_fc_norm_hidden.weight",
+                ]:
+                    name = name.replace("mtp.", "")
+                else:
+                    name = name.replace("mtp", "model")
+            elif "mtp" in name:
+                continue
+
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None
